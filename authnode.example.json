@@ -1,0 +1,56 @@
+{
+  "host": "127.0.0.1",
+  "port": 8788,
+  "jwt_secret": "change-me-local-authnode-secret",
+  "issuer": "authnode.local",
+  "default_audience": ["fastreact", "pska"],
+  "token_ttl_seconds": 28800,
+  "strict_identity": false,
+  "admin_token": "",
+  "allow_unknown_users": true,
+  "allow_unknown_tenants": true,
+  "targets": {
+    "fastreact": {
+      "base_url": "http://127.0.0.1:8000",
+      "mode": "jwt"
+    },
+    "pska": {
+      "base_url": "http://127.0.0.1:8765",
+      "mode": "jwt"
+    }
+  },
+  "tenants": [
+    {
+      "tenant_id": "tenant_default",
+      "tenant_key": "tenant_default",
+      "name": "Default Local Tenant"
+    },
+    {
+      "tenant_id": "tenant_acme",
+      "tenant_key": "tenant_acme",
+      "name": "Acme Local Tenant"
+    }
+  ],
+  "users": [
+    {
+      "user_id": "user_primary",
+      "user_key": "pska:user_primary",
+      "tenant_id": "tenant_default",
+      "tenant_key": "tenant_default",
+      "display_name": "Primary Local User",
+      "email": "primary@example.test",
+      "roles": ["admin"],
+      "groups": ["local"]
+    },
+    {
+      "user_id": "alice",
+      "user_key": "pska:alice",
+      "tenant_id": "tenant_acme",
+      "tenant_key": "tenant_acme",
+      "display_name": "Alice Acme",
+      "email": "alice@example.test",
+      "roles": ["writer"],
+      "groups": ["acme"]
+    }
+  ]
+}

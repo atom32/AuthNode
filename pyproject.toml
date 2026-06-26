@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authnode"
+version = "0.1.0"
+description = "Local multi-tenant auth broker for FastReAct and PSKA development"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "AuthNode local" }]
+dependencies = []
+
+[project.scripts]
+authnode = "authnode.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["authnode*"]
+
