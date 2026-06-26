@@ -241,7 +241,12 @@ def serve(config: AuthNodeConfig, *, host: str | None = None, port: int | None =
     server = AuthNodeHTTPServer(address, AuthNodeHandler, config)
     print(f"AuthNode listening on http://{address[0]}:{address[1]}")
     print(f"Config: {config.source_path or '<memory>'}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nAuthNode stopped.")
+    finally:
+        server.server_close()
 
 
 def proxy_forward_headers(inbound_headers: Mapping[str, str], injected_headers: Mapping[str, str]) -> dict[str, str]:

@@ -16,8 +16,8 @@ usage() {
 Usage:
   ./start.sh             Start AuthNode in the foreground
   ./start.sh --daemon    Start AuthNode in the background
-  ./start.sh --status    Show background process status
-  ./start.sh --stop      Stop background AuthNode process
+  ./start.sh --status    Show daemon PID or foreground HTTP status
+  ./start.sh --stop      Stop background AuthNode process started with --daemon
 
 Environment:
   AUTHNODE_CONFIG        Config path, defaults to ./authnode.local.json
@@ -133,6 +133,25 @@ is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" >/dev/null 2>&1
 }
 
+ready_probe() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    return 1
+  fi
+  local url python
+  url="$(authnode_url)"
+  python="$(select_python)"
+  "$python" - "$url/ready" <<'PY' >/dev/null 2>&1
+from urllib.request import urlopen
+import sys
+
+try:
+    with urlopen(sys.argv[1], timeout=2) as response:
+        raise SystemExit(0 if response.status == 200 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 start_foreground() {
   ensure_config
   build_command
@@ -171,12 +190,24 @@ show_status() {
     print_urls
     return
   fi
-  echo "AuthNode is not running via $PID_FILE."
+  if ready_probe; then
+    echo "AuthNode is responding, but it was not started via ./start.sh --daemon."
+    echo "No daemon PID file is present at $PID_FILE."
+    echo "If you started it with ./start.sh in the foreground, stop it with Ctrl-C in that terminal."
+    print_urls
+    return
+  fi
+  echo "AuthNode is not running via $PID_FILE, and /ready is not responding."
 }
 
 stop_daemon() {
   if ! is_running; then
     rm -f "$PID_FILE"
+    if ready_probe; then
+      echo "AuthNode is responding, but it was not started via ./start.sh --daemon."
+      echo "Stop the foreground process with Ctrl-C in the terminal where ./start.sh is running."
+      return
+    fi
     echo "AuthNode is not running."
     return
   fi
