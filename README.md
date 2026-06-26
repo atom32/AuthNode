@@ -38,23 +38,21 @@ PSKA normalizes `pska:user_primary` to `user_primary` for its internal
 
 ## Quick start
 
-Create a local config and change the dev secret:
+Run AuthNode:
 
 ```bash
-cp authnode.example.json authnode.local.json
-$EDITOR authnode.local.json
+./start.sh
 ```
+
+On first run, `./start.sh` creates `authnode.local.json` and initializes local
+`jwt_secret`/`admin_token` automatically. For non-local use, inject the same JWT
+secret into AuthNode, FastReAct, and PSKA through deployment secrets or
+environment variables.
 
 Print environment variables for FastReAct and PSKA:
 
 ```bash
 python -m authnode env
-```
-
-Run AuthNode:
-
-```bash
-./start.sh
 ```
 
 Issue a token:
@@ -77,9 +75,10 @@ Run in the background:
 ./start.sh --stop
 ```
 
-`./start.sh` only starts AuthNode. It does not start, configure, or mutate
-FastReAct or PSKA. Runtime logs and PID files stay inside this repository under
-`logs/` and `run/`.
+AuthNode's own `./start.sh` only starts AuthNode. FastReAct and PSKA must be
+started from their own repositories or containers; no project start script
+should launch another project. Runtime logs and PID files stay inside this
+repository under `logs/` and `run/`.
 
 Use the local proxy:
 
@@ -94,10 +93,25 @@ For JWT mode:
 
 ```bash
 export FASTREACT_AUTH_MODE=jwt
-export FASTREACT_AUTH_JWT_SECRET='change-me-local-authnode-secret'
+export AUTHNODE_JWT_SECRET='same-secret-injected-into-authnode'
+export FASTREACT_AUTH_JWT_SECRET="$AUTHNODE_JWT_SECRET"
 export FASTREACT_AUTH_JWT_ISSUER='authnode.local'
 export FASTREACT_AUTH_JWT_AUDIENCE='fastreact'
 export FASTREACT_AUTH_JWT_TENANT_CLAIMS='tenant_key,tenant_id,tenant,org_id'
+```
+
+FastReAct JSON config can also reference the env var instead of storing the
+secret directly:
+
+```json
+{
+  "auth": {
+    "mode": "jwt",
+    "jwt_secret_env": "AUTHNODE_JWT_SECRET",
+    "jwt_issuer": "authnode.local",
+    "jwt_audience": "fastreact"
+  }
+}
 ```
 
 For trusted-header mode:
@@ -112,7 +126,8 @@ For JWT mode:
 
 ```bash
 export PSKA_AUTH_MODE=jwt
-export PSKA_AUTH_JWT_SECRET='change-me-local-authnode-secret'
+export AUTHNODE_JWT_SECRET='same-secret-injected-into-authnode'
+export PSKA_AUTH_JWT_SECRET="$AUTHNODE_JWT_SECRET"
 export PSKA_AUTH_JWT_ISSUER='authnode.local'
 export PSKA_AUTH_JWT_AUDIENCE='pska'
 export PSKA_AUTH_JWT_TENANT_CLAIMS='tenant_id,tenant_key,tenant,org_id'
@@ -138,6 +153,12 @@ export PSKA_AUTH_MODE=trusted_headers
 
 The AuthNode/FastReAct/PSKA identity contract is documented in
 `contracts/authnode-fastreact-pska.md`. Run the offline checker with:
+
+For PSKA implementation work, give the PSKA coding agent this prompt:
+
+```text
+contracts/pska-coding-agent-authnode-prompt.md
+```
 
 ```bash
 python -m authnode contract pska:user_primary --tenant tenant_default

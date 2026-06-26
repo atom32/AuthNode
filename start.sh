@@ -25,8 +25,9 @@ Environment:
   AUTHNODE_PORT          Optional serve port override
   AUTHNODE_PYTHON        Optional Python executable override
 
-This script only starts AuthNode. FastReAct and PSKA remain separate projects
-and should be started from their own repositories.
+First run creates ./authnode.local.json and local-only secrets automatically.
+FastReAct and PSKA are started separately from their own repositories or
+containers.
 USAGE
 }
 
@@ -49,16 +50,71 @@ select_python() {
 
 ensure_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
+    ensure_local_secrets
     return
   fi
   if [[ "$CONFIG_FILE" == "$ROOT_DIR/authnode.local.json" ]]; then
     cp "$ROOT_DIR/authnode.example.json" "$CONFIG_FILE"
     echo "Created $CONFIG_FILE from authnode.example.json."
-    echo "Edit jwt_secret/admin_token before using this beyond local development."
+    ensure_local_secrets
     return
   fi
   echo "Config file not found: $CONFIG_FILE" >&2
   exit 1
+}
+
+ensure_local_secrets() {
+  if [[ "$CONFIG_FILE" != "$ROOT_DIR/authnode.local.json" ]]; then
+    return
+  fi
+  local python
+  python="$(select_python)"
+  "$python" - "$CONFIG_FILE" <<'PY'
+from pathlib import Path
+import json
+import secrets
+import sys
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+changed = False
+if not data.get("jwt_secret") or data.get("jwt_secret") == "change-me-local-authnode-secret":
+    data["jwt_secret"] = secrets.token_urlsafe(48)
+    changed = True
+if not data.get("admin_token") or data.get("admin_token") in {"local-admin-token", "change-me-local-admin-token"}:
+    data["admin_token"] = secrets.token_urlsafe(32)
+    changed = True
+if changed:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print("Initialized local jwt_secret/admin_token in authnode.local.json.")
+PY
+}
+
+authnode_url() {
+  local python
+  python="$(select_python)"
+  "$python" - "$CONFIG_FILE" <<'PY'
+from pathlib import Path
+import json
+import os
+import sys
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+host = os.getenv("AUTHNODE_HOST") or data.get("host") or "127.0.0.1"
+port = os.getenv("AUTHNODE_PORT") or data.get("port") or 8788
+display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+print(f"http://{display_host}:{int(port)}")
+PY
+}
+
+print_urls() {
+  local url
+  url="$(authnode_url)"
+  echo "AuthNode ready:       $url/ready"
+  echo "FastReAct proxy:      $url/proxy/fastreact"
+  echo "PSKA proxy:           $url/proxy/pska"
+  echo "Config:               $CONFIG_FILE"
 }
 
 build_command() {
@@ -80,6 +136,7 @@ is_running() {
 start_foreground() {
   ensure_config
   build_command
+  print_urls
   cd "$ROOT_DIR"
   export PYTHONDONTWRITEBYTECODE=1
   export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -92,6 +149,7 @@ start_daemon() {
   mkdir -p "$LOG_DIR" "$RUN_DIR"
   if is_running; then
     echo "AuthNode is already running with pid $(cat "$PID_FILE")."
+    print_urls
     exit 0
   fi
   build_command
@@ -103,12 +161,14 @@ start_daemon() {
   echo "$!" >"$PID_FILE"
   echo "AuthNode started with pid $(cat "$PID_FILE")."
   echo "Log: $LOG_FILE"
+  print_urls
 }
 
 show_status() {
   if is_running; then
     echo "AuthNode is running with pid $(cat "$PID_FILE")."
     echo "Log: $LOG_FILE"
+    print_urls
     return
   fi
   echo "AuthNode is not running via $PID_FILE."
@@ -157,4 +217,3 @@ case "${1:-}" in
     exit 2
     ;;
 esac
-

@@ -3,6 +3,9 @@
 This contract keeps authentication and multi-tenant context consistent across
 the three local services.
 
+For PSKA implementation work, use
+`contracts/pska-coding-agent-authnode-prompt.md` as the coding-agent prompt.
+
 ## Ownership
 
 - AuthNode owns identity proof and tenant/user mapping.
@@ -11,6 +14,10 @@ the three local services.
 
 AuthNode answers "who is this, and which tenant are they in?" It does not grant
 FastReAct workspace permissions or PSKA knowledge permissions.
+
+Startup remains independent: AuthNode, FastReAct, and PSKA are each started by
+their own script or container entrypoint. No project start script launches or
+reads another project's repository-local runtime config.
 
 ## JWT Contract
 
@@ -71,6 +78,26 @@ forwarding:
 It then injects AuthNode-generated JWT or trusted headers for the selected
 target.
 
+## PSKA Gateway/BFF Contract
+
+For browser access, PSKA can run a gateway/BFF in front of its API and built
+frontend:
+
+- The browser talks to the PSKA gateway, not directly to PSKA service auth,
+  FastReAct, or AuthNode admin APIs.
+- The gateway obtains `aud=pska` tokens from AuthNode server-side, stores only a
+  signed HttpOnly browser session, and proxies PSKA API calls with
+  AuthNode-derived JWT/trusted headers.
+- The gateway strips caller-supplied identity headers before injecting
+  `X-PSKA-Tenant-Id`, `X-PSKA-User-Id`, `X-PSKA-Subject`, roles, groups, and
+  provider metadata.
+- `/auth/session` may expose tenant/user metadata for UI state, but must not
+  expose AuthNode admin tokens, PSKA service tokens, FastReAct tokens, or PSKA
+  JWTs.
+- The local gateway login form is a development token-broker shim. Production
+  SSO should use AuthNode/OIDC authorization and callback while preserving the
+  same BFF/session/proxy boundary.
+
 ## Contract Checker
 
 Run offline checks:
@@ -102,4 +129,3 @@ python -m authnode contract pska:user_primary \
 The live FastReAct check sends metadata containing `tenant_key` and
 `auth_contract_check=true`; FastReAct should bind the run to the JWT-derived
 identity, then apply its own workspace and policy rules.
-
