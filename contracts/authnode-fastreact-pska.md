@@ -85,18 +85,20 @@ frontend:
 
 - The browser talks to the PSKA gateway, not directly to PSKA service auth,
   FastReAct, or AuthNode admin APIs.
-- The gateway obtains `aud=pska` tokens from AuthNode server-side, stores only a
-  signed HttpOnly browser session, and proxies PSKA API calls with
-  AuthNode-derived JWT/trusted headers.
+- The gateway obtains `aud=pska` tokens from AuthNode server-side, either by
+  exchanging a one-time browser login code at `POST /v1/auth/exchange` or by
+  receiving already verified callback identity. It stores only a signed
+  HttpOnly browser session and proxies PSKA API calls with AuthNode-derived
+  JWT/trusted headers.
 - The gateway strips caller-supplied identity headers before injecting
   `X-PSKA-Tenant-Id`, `X-PSKA-User-Id`, `X-PSKA-Subject`, roles, groups, and
   provider metadata.
 - `/auth/session` may expose tenant/user metadata for UI state, but must not
   expose AuthNode admin tokens, PSKA service tokens, FastReAct tokens, or PSKA
   JWTs.
-- The local gateway login form is a development token-broker shim. Production
-  SSO should use AuthNode/OIDC authorization and callback while preserving the
-  same BFF/session/proxy boundary.
+- AuthNode browser login redirects back to PSKA Gateway with a short-lived
+  one-time code, not a downstream JWT in the browser URL. Production SSO should
+  keep the same code/callback and BFF/session/proxy boundary.
 
 ## Contract Checker
 

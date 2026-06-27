@@ -3,7 +3,11 @@ from __future__ import annotations
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
+import html
 import json
+import secrets
+from threading import Lock
+import time
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
@@ -24,6 +28,40 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], RequestHandlerClass: type[BaseHTTPRequestHandler], config: AuthNodeConfig):
         super().__init__(server_address, RequestHandlerClass)
         self.config = config
+        self.auth_codes: dict[str, dict[str, Any]] = {}
+        self.auth_codes_lock = Lock()
+
+    def issue_auth_code(
+        self,
+        *,
+        user_key: str | None,
+        tenant: str | None,
+        target: str,
+        return_to: str,
+        state: str | None,
+        next_path: str | None,
+    ) -> str:
+        code = secrets.token_urlsafe(32)
+        with self.auth_codes_lock:
+            self.auth_codes[code] = {
+                "user_key": user_key,
+                "tenant": tenant,
+                "target": target,
+                "return_to": return_to,
+                "state": state or "",
+                "next": next_path or "",
+                "exp": time.time() + 300,
+            }
+        return code
+
+    def consume_auth_code(self, code: str) -> dict[str, Any] | None:
+        with self.auth_codes_lock:
+            payload = self.auth_codes.pop(code, None)
+        if not payload:
+            return None
+        if time.time() >= float(payload.get("exp") or 0):
+            return None
+        return payload
 
 
 class AuthNodeHandler(BaseHTTPRequestHandler):
@@ -62,6 +100,15 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/users":
                 self._json({"users": [public_user(item) for item in self.server.config.users]})
                 return
+            if parsed.path == "/login" and self.command == "GET":
+                self._handle_login_form(parsed.query)
+                return
+            if parsed.path == "/login" and self.command == "POST":
+                self._handle_login_submit()
+                return
+            if parsed.path == "/v1/auth/exchange":
+                self._handle_auth_exchange()
+                return
             if parsed.path == "/v1/token":
                 if not self._require_admin_auth():
                     return
@@ -98,6 +145,120 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             ttl_seconds=int(ttl) if ttl else None,
         )
         self._json(token_response(token, claims))
+
+    def _handle_login_form(self, query: str) -> None:
+        params = parse_qs(query)
+        target = _first(params.get("target")) or "pska"
+        return_to = _first(params.get("return_to")) or ""
+        if not return_to:
+            self._error(HTTPStatus.BAD_REQUEST, "return_to is required")
+            return
+        next_path = _first(params.get("next")) or "/"
+        requested_user = _first(params.get("user_key"), params.get("user_id"))
+        requested_tenant = _first(params.get("tenant_id"), params.get("tenant_key"))
+        users = [public_user(user) for user in self.server.config.users]
+        if not users:
+            default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
+            users = [public_user(default_user)]
+        options = "\n".join(
+            _user_option(user, selected_user=requested_user, selected_tenant=requested_tenant)
+            for user in users
+        )
+        body = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuthNode Login</title>
+  <style>
+    :root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f7f7f4; color: #171717; }}
+    main {{ width: min(430px, calc(100vw - 32px)); border: 1px solid #d7d7cf; border-radius: 8px; background: #fff; padding: 28px; box-shadow: 0 18px 50px rgba(28, 31, 35, 0.10); }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }}
+    p {{ margin: 0 0 20px; color: #666; line-height: 1.5; }}
+    label {{ display: grid; gap: 8px; margin: 16px 0; font-size: 13px; color: #555; }}
+    select {{ min-height: 42px; border: 1px solid #cbc7ba; border-radius: 7px; padding: 0 12px; font: inherit; background: #fff; }}
+    button {{ width: 100%; height: 42px; margin-top: 8px; border: 0; border-radius: 7px; background: #245b52; color: white; font-weight: 700; cursor: pointer; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AuthNode</h1>
+    <p>选择一个本地身份继续访问 {html.escape(target)}。这是开发用登录入口，不向浏览器暴露服务 token。</p>
+    <form method="post" action="/login">
+      <input type="hidden" name="target" value="{html.escape(target, quote=True)}">
+      <input type="hidden" name="return_to" value="{html.escape(return_to, quote=True)}">
+      <input type="hidden" name="next" value="{html.escape(next_path, quote=True)}">
+      <input type="hidden" name="state" value="{html.escape(_first(params.get("state")) or "", quote=True)}">
+      <label>Identity
+        <select name="identity" required>
+          {options}
+        </select>
+      </label>
+      <button type="submit">继续</button>
+    </form>
+  </main>
+</body>
+</html>"""
+        self._html(body)
+
+    def _handle_login_submit(self) -> None:
+        form = self._form_body()
+        identity = _first(form.get("identity"))
+        target = _first(form.get("target")) or "pska"
+        return_to = _first(form.get("return_to"))
+        if not identity or not return_to:
+            self._error(HTTPStatus.BAD_REQUEST, "identity and return_to are required")
+            return
+        user_key, tenant = _split_identity(identity)
+        user = self.server.config.user_for(user_key, tenant_id_or_key=tenant)
+        tenant_item = self.server.config.tenant_for(tenant or user.tenant_id or user.tenant_key)
+        code = self.server.issue_auth_code(
+            user_key=user.user_key,
+            tenant=tenant_item.tenant_id,
+            target=target,
+            return_to=return_to,
+            state=_first(form.get("state")),
+            next_path=_first(form.get("next")),
+        )
+        params = {"code": code}
+        state = _first(form.get("state"))
+        next_path = _first(form.get("next"))
+        if state:
+            params["state"] = state
+        if next_path:
+            params["next"] = next_path
+        self._redirect(_append_query(return_to, params))
+
+    def _handle_auth_exchange(self) -> None:
+        body = self._json_body()
+        code = str(body.get("code") or "").strip()
+        if not code:
+            self._error(HTTPStatus.BAD_REQUEST, "code is required")
+            return
+        payload = self.server.consume_auth_code(code)
+        if payload is None:
+            self._error(HTTPStatus.BAD_REQUEST, "auth code is invalid or expired")
+            return
+        target_name = str(body.get("target") or payload.get("target") or "pska").strip().lower()
+        if target_name != str(payload.get("target") or "").strip().lower():
+            self._error(HTTPStatus.BAD_REQUEST, "auth code target mismatch")
+            return
+        token, claims = issue_identity_token(
+            self.server.config,
+            str(payload.get("user_key") or ""),
+            tenant_id_or_key=str(payload.get("tenant") or ""),
+            audience=_target_audience(target_name),
+        )
+        response = token_response(token, claims)
+        response.update(
+            {
+                "state": payload.get("state") or "",
+                "next": payload.get("next") or "",
+                "target": target_name,
+            }
+        )
+        self._json(response)
 
     def _handle_headers(self, query: str) -> None:
         params = parse_qs(query)
@@ -171,6 +332,13 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON body must be an object")
         return value
 
+    def _form_body(self) -> dict[str, list[str]]:
+        length = int(self.headers.get("content-length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+
     def _ready_payload(self) -> dict[str, Any]:
         config = self.server.config
         return {
@@ -209,6 +377,21 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _html(self, payload: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = payload.encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("cache-control", "no-store")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.FOUND) -> None:
+        self.send_response(status)
+        self.send_header("location", location)
+        self.send_header("content-length", "0")
+        self.end_headers()
 
     def _error(self, status: HTTPStatus, message: str) -> None:
         self._json({"ok": False, "error": message}, status=status)
@@ -288,6 +471,44 @@ def _join_target_url(target: Target, target_path: str, query: str) -> str:
     split = urlsplit(target.base_url)
     base_path = split.path.rstrip("/")
     return urlunsplit((split.scheme, split.netloc, f"{base_path}{path}", query, ""))
+
+
+def _target_audience(name: str) -> list[str]:
+    target = name.strip().lower()
+    if target in {"fastreact", "pska"}:
+        return [target]
+    return [target]
+
+
+def _append_query(url: str, params: Mapping[str, str]) -> str:
+    split = urlsplit(url)
+    existing = parse_qs(split.query, keep_blank_values=True)
+    for key, value in params.items():
+        existing[key] = [value]
+    return urlunsplit((split.scheme, split.netloc, split.path, urlencode(existing, doseq=True), split.fragment))
+
+
+def _split_identity(value: str) -> tuple[str, str | None]:
+    user_key, _, tenant = value.partition("|")
+    return user_key.strip(), tenant.strip() or None
+
+
+def _user_option(user: Mapping[str, Any], *, selected_user: str | None, selected_tenant: str | None) -> str:
+    user_key = str(user.get("user_key") or user.get("user_id") or "")
+    tenant_id = str(user.get("tenant_id") or user.get("tenant_key") or "")
+    label_parts = [
+        str(user.get("display_name") or user.get("user_id") or user_key),
+        f"{user_key}",
+        f"tenant={tenant_id}",
+    ]
+    selected = ""
+    if selected_user and selected_tenant:
+        user_matches = selected_user in {user_key, str(user.get("user_id") or "")}
+        tenant_matches = selected_tenant in {tenant_id, str(user.get("tenant_key") or "")}
+        selected = " selected" if user_matches and tenant_matches else ""
+    value = html.escape(f"{user_key}|{tenant_id}", quote=True)
+    label = html.escape(" / ".join(part for part in label_parts if part), quote=True)
+    return f'<option value="{value}"{selected}>{label}</option>'
 
 
 def _bearer_token(value: str | None) -> str | None:

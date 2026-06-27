@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import unittest
 from threading import Thread
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from authnode.config import AuthNodeConfig
 from authnode.contract import check_contract
@@ -124,6 +126,58 @@ class AuthNodeTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_browser_login_issues_one_time_code_for_exchange(self) -> None:
+        server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, self.config)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        opener = build_opener(NoRedirectHandler)
+        try:
+            with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
+                page = response.read().decode("utf-8")
+            self.assertIn("pska:alice", page)
+
+            body = urlencode(
+                {
+                    "identity": "pska:alice|tenant_a",
+                    "target": "pska",
+                    "return_to": "http://pska.local/auth/callback",
+                    "next": "/",
+                }
+            ).encode()
+            request = Request(
+                f"{base_url}/login",
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            response = _open_no_redirect(opener, request)
+            self.assertEqual(response.code, 302)
+            location = response.headers["Location"]
+            params = parse_qs(urlsplit(location).query)
+            code = params["code"][0]
+
+            exchange_body = json.dumps({"code": code, "target": "pska"}).encode()
+            exchange_request = Request(
+                f"{base_url}/v1/auth/exchange",
+                data=exchange_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(exchange_request, timeout=5) as exchange_response:
+                exchanged = json.loads(exchange_response.read().decode("utf-8"))
+            decoded = decode_hs256(exchanged["access_token"], "test-secret", issuer="authnode.test", audience="pska")
+            self.assertEqual(decoded["sub"], "pska:alice")
+            self.assertEqual(exchanged["target"], "pska")
+
+            with self.assertRaises(HTTPError) as blocked:
+                urlopen(exchange_request, timeout=5)
+            self.assertEqual(blocked.exception.code, 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_proxy_forward_headers_strip_spoofed_identity(self) -> None:
         forwarded = proxy_forward_headers(
             {
@@ -151,6 +205,20 @@ class AuthNodeTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(report["user"]["user_key"], "pska:alice")
         self.assertIn("proxy_strips_spoofed_identity_headers", {check["name"] for check in report["checks"]})
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 - urllib hook signature.
+        return None
+
+
+def _open_no_redirect(opener, request):  # noqa: ANN001 - urllib opener/response test helper.
+    try:
+        return opener.open(request, timeout=5)
+    except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return exc
+        raise
 
 
 if __name__ == "__main__":

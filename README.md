@@ -143,11 +143,37 @@ export PSKA_AUTH_MODE=trusted_headers
 
 - `GET /health`
 - `GET /ready`
+- `GET /login`
+- `POST /login`
+- `POST /v1/auth/exchange`
 - `GET /v1/tenants`
 - `GET /v1/users`
 - `POST /v1/token`
 - `GET /v1/headers`
 - `ANY /proxy/{target}/{path}`
+
+## Browser login code flow
+
+For local browser smoke tests, AuthNode provides a small OAuth-like code flow.
+The browser never receives a PSKA/FastReAct service token, AuthNode admin token,
+or downstream JWT in JavaScript.
+
+1. PSKA Gateway redirects an unauthenticated browser to:
+
+```text
+http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
+```
+
+2. AuthNode shows the local user catalog and redirects back to PSKA Gateway with
+   a short-lived one-time `code`.
+3. PSKA Gateway calls `POST /v1/auth/exchange` server-side and receives an
+   `aud=pska` JWT plus claims.
+4. PSKA Gateway stores only a signed HttpOnly session cookie in the browser and
+   proxies later API calls to PSKA with server-side identity material.
+
+`/v1/auth/exchange` is intentionally separate from `/v1/token`: it consumes only
+codes that AuthNode created through `/login`, and it does not require exposing
+the AuthNode admin token to PSKA or the browser.
 
 ## Cross-project contract
 

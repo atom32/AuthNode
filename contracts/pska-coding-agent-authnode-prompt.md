@@ -38,6 +38,9 @@ Useful endpoints:
 
 ```http
 GET  /ready
+GET  /login
+POST /login
+POST /v1/auth/exchange
 GET  /v1/tenants
 GET  /v1/users
 POST /v1/token
@@ -169,16 +172,18 @@ curl "http://127.0.0.1:8788/proxy/pska/ready?authnode_user_key=pska:user_primary
 
 PSKA may provide a thin gateway/BFF for browser access. This gateway is allowed
 to serve the built PSKA frontend, redirect unauthenticated browser requests,
-ask AuthNode for a short-lived `aud=pska` token, store a signed HttpOnly
-session cookie, and proxy API requests to PSKA.
+consume an AuthNode browser login code or verified callback identity, store a
+signed HttpOnly session cookie, and proxy API requests to PSKA.
 
 This gateway must still treat AuthNode as the identity broker:
 
 - The built-in `/login` page is a local/dev token-broker shim, not a PSKA
   password database, registration UI, or organization admin console.
-- A production SSO/OIDC flow should replace the local `/login` form with
-  AuthNode `/authorize -> callback`, while keeping the same BFF/session/proxy
-  boundary.
+- A production SSO/OIDC flow should use AuthNode/OIDC `/login` or
+  `/authorize -> callback` with a one-time code. The browser must not receive
+  downstream PSKA/FastReAct JWTs in URLs or JavaScript.
+- PSKA Gateway may call AuthNode `POST /v1/auth/exchange` server-side to
+  exchange a one-time browser login code for an `aud=pska` JWT and claims.
 - Browser JavaScript must never receive AuthNode admin tokens, PSKA service
   tokens, FastReAct service tokens, or PSKA JWTs.
 - `/auth/session` may return tenant/user/profile metadata, but not bearer
