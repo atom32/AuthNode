@@ -168,11 +168,55 @@ class AuthNodeTests(unittest.TestCase):
                 exchanged = json.loads(exchange_response.read().decode("utf-8"))
             decoded = decode_hs256(exchanged["access_token"], "test-secret", issuer="authnode.test", audience="pska")
             self.assertEqual(decoded["sub"], "pska:alice")
+            self.assertEqual(decoded["tenant_id"], "tenant_a")
             self.assertEqual(exchanged["target"], "pska")
 
             with self.assertRaises(HTTPError) as blocked:
                 urlopen(exchange_request, timeout=5)
             self.assertEqual(blocked.exception.code, 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_browser_login_preserves_unknown_tenant_when_catalog_exists(self) -> None:
+        server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, self.config)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        opener = build_opener(NoRedirectHandler)
+        try:
+            body = urlencode(
+                {
+                    "identity": "pska:e2e-writer|tenant_dynamic",
+                    "target": "pska",
+                    "return_to": "http://pska.local/auth/callback",
+                    "next": "/",
+                }
+            ).encode()
+            request = Request(
+                f"{base_url}/login",
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            response = _open_no_redirect(opener, request)
+            location = response.headers["Location"]
+            code = parse_qs(urlsplit(location).query)["code"][0]
+
+            exchange_body = json.dumps({"code": code, "target": "pska"}).encode()
+            exchange_request = Request(
+                f"{base_url}/v1/auth/exchange",
+                data=exchange_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(exchange_request, timeout=5) as exchange_response:
+                exchanged = json.loads(exchange_response.read().decode("utf-8"))
+            decoded = decode_hs256(exchanged["access_token"], "test-secret", issuer="authnode.test", audience="pska")
+            self.assertEqual(decoded["sub"], "pska:e2e-writer")
+            self.assertEqual(decoded["tenant_id"], "tenant_dynamic")
+            self.assertEqual(decoded["tenant_key"], "tenant_dynamic")
         finally:
             server.shutdown()
             server.server_close()

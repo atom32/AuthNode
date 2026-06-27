@@ -92,11 +92,13 @@ class AuthNodeConfig:
                 return tenant
         if key and not self.allow_unknown_tenants:
             raise ValueError(f"unknown tenant: {key}")
+        if key:
+            return Tenant(tenant_id=key, tenant_key=key)
         if self.tenants:
             return self.tenants[0]
         if not self.allow_unknown_tenants:
             raise ValueError("tenant is required")
-        return Tenant(tenant_id=key or "tenant_default", tenant_key=key or "tenant_default")
+        return Tenant(tenant_id="tenant_default", tenant_key="tenant_default")
 
     def user_for(self, user_key_or_id: str | None, *, tenant_id_or_key: str | None = None) -> User:
         value = (user_key_or_id or "").strip()
