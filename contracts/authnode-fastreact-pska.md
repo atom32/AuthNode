@@ -15,9 +15,15 @@ For PSKA implementation work, use
 AuthNode answers "who is this, and which tenant are they in?" It does not grant
 FastReAct workspace permissions or PSKA knowledge permissions.
 
-For local browser smoke tests, AuthNode owns the tenant/username/password login
-form and gives PSKA Gateway only a short-lived one-time code. PSKA Gateway
-exchanges that code server-side and stores a server-managed browser session.
+For browser smoke tests, AuthNode owns the login entrypoint. In local mode it
+shows a tenant/username/password form; in Keycloak mode it redirects to OIDC and
+handles `/oidc/callback`. In both modes it gives PSKA Gateway only a short-lived
+one-time code. PSKA Gateway exchanges that code server-side and stores a
+server-managed browser session.
+
+In Keycloak mode, tenant identity must come from a verified token claim such as
+`tenant_id` or `tenant_key`. Missing tenant/user claims fail closed before
+AuthNode issues downstream PSKA/FastReAct credentials.
 
 Startup remains independent: AuthNode, FastReAct, and PSKA are each started by
 their own script or container entrypoint. No project start script launches or
@@ -102,7 +108,8 @@ frontend:
   JWTs.
 - AuthNode browser login redirects back to PSKA Gateway with a short-lived
   one-time code, not a downstream JWT in the browser URL. Production SSO should
-  keep the same code/callback and BFF/session/proxy boundary.
+  keep the same OIDC -> AuthNode code -> PSKA callback and BFF/session/proxy
+  boundary.
 
 ## Contract Checker
 

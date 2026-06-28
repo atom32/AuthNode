@@ -56,6 +56,18 @@ def issue_identity_token(
     return encode_hs256(claims, config.jwt_secret), claims
 
 
+def issue_identity_token_for_user(
+    config: AuthNodeConfig,
+    user: User,
+    *,
+    tenant: Tenant,
+    audience: list[str] | tuple[str, ...] | str | None = None,
+    ttl_seconds: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    claims = claims_for_user(config, user, tenant=tenant, audience=audience, ttl_seconds=ttl_seconds)
+    return encode_hs256(claims, config.jwt_secret), claims
+
+
 def trusted_headers_for_user(
     config: AuthNodeConfig,
     user_key_or_id: str | None = None,
@@ -174,4 +186,3 @@ def _target_audience(name: str) -> list[str]:
     if target in {"fastreact", "pska"}:
         return [target]
     return [target]
-

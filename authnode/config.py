@@ -41,6 +41,20 @@ class Target:
 
 
 @dataclass(frozen=True, slots=True)
+class KeycloakConfig:
+    issuer_url: str = ""
+    client_id: str = ""
+    client_secret_env: str = "AUTHNODE_KEYCLOAK_CLIENT_SECRET"
+    redirect_uri: str = ""
+    scopes: tuple[str, ...] = ("openid", "profile", "email")
+    tenant_claims: tuple[str, ...] = ("tenant_id", "tenant_key")
+    user_id_claims: tuple[str, ...] = ("preferred_username", "sub")
+    user_key_claims: tuple[str, ...] = ()
+    role_claims: tuple[str, ...] = ("roles", "realm_access.roles")
+    group_claims: tuple[str, ...] = ("groups",)
+
+
+@dataclass(frozen=True, slots=True)
 class AuthNodeConfig:
     host: str = "127.0.0.1"
     port: int = 8788
@@ -50,12 +64,14 @@ class AuthNodeConfig:
     token_ttl_seconds: int = 28800
     strict_identity: bool = False
     admin_token: str | None = None
+    browser_login_provider: str = "local"
     dev_login_password: str = ""
     allow_unknown_users: bool = True
     allow_unknown_tenants: bool = True
     tenants: tuple[Tenant, ...] = field(default_factory=tuple)
     users: tuple[User, ...] = field(default_factory=tuple)
     targets: dict[str, Target] = field(default_factory=dict)
+    keycloak: KeycloakConfig = field(default_factory=KeycloakConfig)
     source_path: Path | None = None
 
     @classmethod
@@ -79,12 +95,14 @@ class AuthNodeConfig:
             token_ttl_seconds=int(data.get("token_ttl_seconds") or 28800),
             strict_identity=strict_identity,
             admin_token=_optional_string(data.get("admin_token")),
+            browser_login_provider=str(data.get("browser_login_provider") or "local").strip().lower(),
             dev_login_password=str(data.get("dev_login_password") or data.get("local_login_password") or ""),
             allow_unknown_users=_bool(data.get("allow_unknown_users"), default=not strict_identity),
             allow_unknown_tenants=_bool(data.get("allow_unknown_tenants"), default=not strict_identity),
             tenants=tenants,
             users=users,
             targets=targets,
+            keycloak=_keycloak_from_dict(data.get("keycloak") or {}),
             source_path=source_path,
         )
 
@@ -220,6 +238,25 @@ def _target_from_dict(name: str, data: Any) -> Target:
         base_url=base_url,
         mode=str(data.get("mode") or "jwt").strip().lower(),
         service_token=str(service_token).strip() if service_token else None,
+    )
+
+
+def _keycloak_from_dict(data: Any) -> KeycloakConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("keycloak config must be an object")
+    return KeycloakConfig(
+        issuer_url=str(data.get("issuer_url") or data.get("issuer") or "").rstrip("/"),
+        client_id=str(data.get("client_id") or "").strip(),
+        client_secret_env=str(data.get("client_secret_env") or "AUTHNODE_KEYCLOAK_CLIENT_SECRET").strip(),
+        redirect_uri=str(data.get("redirect_uri") or "").strip(),
+        scopes=tuple(_string_list(data.get("scopes"))) or ("openid", "profile", "email"),
+        tenant_claims=tuple(_string_list(data.get("tenant_claims"))) or ("tenant_id", "tenant_key"),
+        user_id_claims=tuple(_string_list(data.get("user_id_claims"))) or ("preferred_username", "sub"),
+        user_key_claims=tuple(_string_list(data.get("user_key_claims"))),
+        role_claims=tuple(_string_list(data.get("role_claims"))) or ("roles", "realm_access.roles"),
+        group_claims=tuple(_string_list(data.get("group_claims"))) or ("groups",),
     )
 
 

@@ -6,6 +6,7 @@ import hmac
 import html
 import json
 import secrets
+import string
 from threading import Lock
 import time
 from typing import Any, Mapping
@@ -13,14 +14,23 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from authnode.config import AuthNodeConfig, Target
+from authnode.config import AuthNodeConfig, Target, Tenant, User
 from authnode.identity import (
+    issue_identity_token_for_user,
     issue_identity_token,
     outbound_headers_for_target,
     public_tenant,
     public_user,
     token_response,
     trusted_headers_for_user,
+)
+from authnode.oidc import (
+    OidcCache,
+    OidcError,
+    authorization_url,
+    code_challenge,
+    exchange_code_for_identity,
+    logout_url,
 )
 
 
@@ -30,6 +40,9 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.auth_codes: dict[str, dict[str, Any]] = {}
         self.auth_codes_lock = Lock()
+        self.oidc_states: dict[str, dict[str, Any]] = {}
+        self.oidc_states_lock = Lock()
+        self.oidc_cache = OidcCache()
 
     def issue_auth_code(
         self,
@@ -40,6 +53,7 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
         return_to: str,
         state: str | None,
         next_path: str | None,
+        identity: Mapping[str, Any] | None = None,
     ) -> str:
         code = secrets.token_urlsafe(32)
         with self.auth_codes_lock:
@@ -52,11 +66,50 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
                 "next": next_path or "",
                 "exp": time.time() + 300,
             }
+            if identity:
+                self.auth_codes[code]["identity"] = dict(identity)
         return code
 
     def consume_auth_code(self, code: str) -> dict[str, Any] | None:
         with self.auth_codes_lock:
             payload = self.auth_codes.pop(code, None)
+        if not payload:
+            return None
+        if time.time() >= float(payload.get("exp") or 0):
+            return None
+        return payload
+
+    def issue_oidc_state(
+        self,
+        *,
+        target: str,
+        return_to: str,
+        next_path: str | None,
+        state: str | None,
+    ) -> dict[str, str]:
+        oidc_state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        code_verifier = _pkce_verifier()
+        with self.oidc_states_lock:
+            self.oidc_states[oidc_state] = {
+                "target": target,
+                "return_to": return_to,
+                "next": next_path or "",
+                "state": state or "",
+                "nonce": nonce,
+                "code_verifier": code_verifier,
+                "exp": time.time() + 600,
+            }
+        return {
+            "state": oidc_state,
+            "nonce": nonce,
+            "code_verifier": code_verifier,
+            "code_challenge": code_challenge(code_verifier),
+        }
+
+    def consume_oidc_state(self, state: str) -> dict[str, Any] | None:
+        with self.oidc_states_lock:
+            payload = self.oidc_states.pop(state, None)
         if not payload:
             return None
         if time.time() >= float(payload.get("exp") or 0):
@@ -106,6 +159,12 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             if parsed.path == "/login" and self.command == "POST":
                 self._handle_login_submit()
                 return
+            if parsed.path == "/oidc/callback" and self.command == "GET":
+                self._handle_oidc_callback(parsed.query)
+                return
+            if parsed.path == "/logout" and self.command == "GET":
+                self._handle_logout(parsed.query)
+                return
             if parsed.path == "/v1/auth/exchange":
                 self._handle_auth_exchange()
                 return
@@ -154,6 +213,26 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "return_to is required")
             return
         next_path = _first(params.get("next")) or "/"
+        if self.server.config.browser_login_provider == "keycloak" and not _truthy(_first(params.get("local"))):
+            oidc = self.server.issue_oidc_state(
+                target=target,
+                return_to=return_to,
+                next_path=next_path,
+                state=_first(params.get("state")),
+            )
+            try:
+                login_url = authorization_url(
+                    self.server.config,
+                    self.server.oidc_cache,
+                    state=oidc["state"],
+                    nonce=oidc["nonce"],
+                    code_challenge=oidc["code_challenge"],
+                )
+            except OidcError as exc:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+                return
+            self._redirect(login_url)
+            return
         requested_user = _first(params.get("user_key"), params.get("user_id"))
         requested_tenant = _first(params.get("tenant_id"), params.get("tenant_key"))
         default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
@@ -251,6 +330,62 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             params["next"] = next_path
         self._redirect(_append_query(return_to, params))
 
+    def _handle_oidc_callback(self, query: str) -> None:
+        params = parse_qs(query)
+        error = _first(params.get("error"))
+        if error:
+            detail = _first(params.get("error_description")) or error
+            self._error(HTTPStatus.UNAUTHORIZED, f"Keycloak login failed: {detail}")
+            return
+        state = _first(params.get("state")) or ""
+        code = _first(params.get("code")) or ""
+        if not state or not code:
+            self._error(HTTPStatus.BAD_REQUEST, "OIDC callback requires state and code")
+            return
+        state_payload = self.server.consume_oidc_state(state)
+        if state_payload is None:
+            self._error(HTTPStatus.UNAUTHORIZED, "OIDC state is invalid or expired")
+            return
+        try:
+            identity = exchange_code_for_identity(
+                self.server.config,
+                self.server.oidc_cache,
+                code=code,
+                code_verifier=str(state_payload.get("code_verifier") or ""),
+                nonce=str(state_payload.get("nonce") or ""),
+            )
+        except OidcError as exc:
+            self._error(HTTPStatus.UNAUTHORIZED, str(exc))
+            return
+        auth_code = self.server.issue_auth_code(
+            user_key=identity.user.user_key,
+            tenant=identity.tenant.tenant_id,
+            target=str(state_payload.get("target") or "pska"),
+            return_to=str(state_payload.get("return_to") or ""),
+            state=str(state_payload.get("state") or ""),
+            next_path=str(state_payload.get("next") or ""),
+            identity=_identity_payload(identity.user, identity.tenant),
+        )
+        redirect_params = {"code": auth_code}
+        app_state = str(state_payload.get("state") or "")
+        next_path = str(state_payload.get("next") or "")
+        if app_state:
+            redirect_params["state"] = app_state
+        if next_path:
+            redirect_params["next"] = next_path
+        self._redirect(_append_query(str(state_payload.get("return_to") or ""), redirect_params))
+
+    def _handle_logout(self, query: str) -> None:
+        params = parse_qs(query)
+        return_to = _first(params.get("return_to")) or "/"
+        if self.server.config.browser_login_provider == "keycloak":
+            try:
+                self._redirect(logout_url(self.server.config, self.server.oidc_cache, return_to=return_to))
+                return
+            except OidcError:
+                pass
+        self._redirect(return_to)
+
     def _handle_auth_exchange(self) -> None:
         body = self._json_body()
         code = str(body.get("code") or "").strip()
@@ -265,12 +400,22 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         if target_name != str(payload.get("target") or "").strip().lower():
             self._error(HTTPStatus.BAD_REQUEST, "auth code target mismatch")
             return
-        token, claims = issue_identity_token(
-            self.server.config,
-            str(payload.get("user_key") or ""),
-            tenant_id_or_key=str(payload.get("tenant") or ""),
-            audience=_target_audience(target_name),
-        )
+        identity = payload.get("identity")
+        if isinstance(identity, dict):
+            user, tenant = _identity_from_payload(identity)
+            token, claims = issue_identity_token_for_user(
+                self.server.config,
+                user,
+                tenant=tenant,
+                audience=_target_audience(target_name),
+            )
+        else:
+            token, claims = issue_identity_token(
+                self.server.config,
+                str(payload.get("user_key") or ""),
+                tenant_id_or_key=str(payload.get("tenant") or ""),
+                audience=_target_audience(target_name),
+            )
         response = token_response(token, claims)
         response.update(
             {
@@ -370,6 +515,8 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             "allow_unknown_users": config.allow_unknown_users,
             "allow_unknown_tenants": config.allow_unknown_tenants,
             "admin_token_configured": bool(config.admin_token),
+            "browser_login_provider": config.browser_login_provider,
+            "keycloak_configured": bool(config.keycloak.issuer_url and config.keycloak.client_id),
             "tenants": len(config.tenants),
             "users": len(config.users),
             "targets": {
@@ -519,6 +666,62 @@ def _verify_login_password(config: AuthNodeConfig, user: Any, password: str) -> 
     if not expected:
         return False
     return hmac.compare_digest(password, expected)
+
+
+def _identity_payload(user: User, tenant: Tenant) -> dict[str, Any]:
+    return {
+        "user_id": user.user_id,
+        "user_key": user.user_key,
+        "tenant_id": tenant.tenant_id,
+        "tenant_key": tenant.tenant_key,
+        "display_name": user.display_name,
+        "email": user.email,
+        "roles": list(user.roles),
+        "groups": list(user.groups),
+        "provider": user.provider,
+    }
+
+
+def _identity_from_payload(payload: Mapping[str, Any]) -> tuple[User, Tenant]:
+    tenant = Tenant(
+        tenant_id=str(payload.get("tenant_id") or payload.get("tenant_key") or ""),
+        tenant_key=str(payload.get("tenant_key") or payload.get("tenant_id") or ""),
+    )
+    user_id = str(payload.get("user_id") or "").removeprefix("pska:")
+    user_key = str(payload.get("user_key") or user_id)
+    if user_key and ":" not in user_key:
+        user_key = f"pska:{user_key}"
+    user = User(
+        user_id=user_id,
+        user_key=user_key,
+        tenant_id=tenant.tenant_id,
+        tenant_key=tenant.tenant_key,
+        display_name=str(payload.get("display_name") or user_id),
+        email=str(payload.get("email") or ""),
+        roles=tuple(_list_value(payload.get("roles"))),
+        groups=tuple(_list_value(payload.get("groups"))),
+        provider=str(payload.get("provider") or "keycloak"),
+    )
+    return user, tenant
+
+
+def _pkce_verifier() -> str:
+    alphabet = string.ascii_letters + string.digits + "-._~"
+    return "".join(secrets.choice(alphabet) for _ in range(64))
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _list_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
 
 
 def _user_option(user: Mapping[str, Any], *, selected_user: str | None, selected_tenant: str | None) -> str:

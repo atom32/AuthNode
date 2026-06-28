@@ -48,9 +48,10 @@ GET  /v1/headers
 ANY  /proxy/pska/{path}
 ```
 
-For local browser smoke tests, `GET /login` shows an AuthNode-owned
-tenant/username/password form and returns to PSKA Gateway with a short-lived
-one-time code. PSKA must consume the code server-side through
+For browser smoke tests, `GET /login` is AuthNode-owned. In local mode it shows
+a tenant/username/password form; in Keycloak mode it redirects to OIDC and then
+handles `GET /oidc/callback`. `GET /login?local=1` keeps the local form for dev
+and E2E. PSKA must consume the returned one-time code server-side through
 `POST /v1/auth/exchange`; PSKA must not build its own password database or
 expose downstream JWT/service/admin tokens to browser JavaScript.
 
@@ -185,9 +186,12 @@ This gateway must still treat AuthNode as the identity broker:
 
 - The built-in `/login` page is a local/dev token-broker shim, not a PSKA
   password database, registration UI, or organization admin console.
-- A production SSO/OIDC flow should use AuthNode/OIDC `/login` or
-  `/authorize -> callback` with a one-time code. The browser must not receive
-  downstream PSKA/FastReAct JWTs in URLs or JavaScript.
+- A production SSO/OIDC flow should use AuthNode `/login` -> Keycloak/OIDC ->
+  AuthNode `/oidc/callback` -> PSKA `/auth/callback` with a one-time code. The
+  browser must not receive downstream PSKA/FastReAct JWTs in URLs or
+  JavaScript.
+- Keycloak tenant/user mapping is AuthNode's job. Missing tenant/user claims
+  must fail closed before PSKA receives a session.
 - PSKA Gateway may call AuthNode `POST /v1/auth/exchange` server-side to
   exchange a one-time browser login code for an `aud=pska` JWT and claims.
 - Browser JavaScript must never receive AuthNode admin tokens, PSKA service

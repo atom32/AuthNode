@@ -6,6 +6,7 @@ identity contract that a future SSO gateway or identity broker would provide:
 
 - a local tenant/user catalog;
 - a local username/password login page for browser smoke tests;
+- a Keycloak/OIDC browser login broker for production-like tests;
 - HS256 JWTs accepted by FastReAct and PSKA;
 - trusted headers accepted by FastReAct and PSKA;
 - an optional local proxy that injects JWTs or trusted headers into upstream
@@ -57,10 +58,30 @@ For the browser flow, open PSKA and let it redirect to AuthNode, or visit:
 http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
 ```
 
-The local login form asks for `tenant_id`, `username`, and `password`. Users can
-define their own `password`; unknown users in non-strict local mode can use
-`dev_login_password`. Keep these local passwords out of repository history when
-using a private `authnode.local.json`.
+By default the example config uses local login. The local login form asks for
+`tenant_id`, `username`, and `password`; unknown users in non-strict local mode
+can use `dev_login_password`. Keep these local passwords out of repository
+history when using a private `authnode.local.json`.
+
+To send normal browser login through Keycloak, set:
+
+```json
+{
+  "browser_login_provider": "keycloak",
+  "keycloak": {
+    "issuer_url": "http://127.0.0.1:8080/realms/pska-local",
+    "client_id": "authnode",
+    "client_secret_env": "AUTHNODE_KEYCLOAK_CLIENT_SECRET",
+    "redirect_uri": "http://127.0.0.1:8788/oidc/callback",
+    "tenant_claims": ["tenant_id", "tenant_key"],
+    "user_id_claims": ["preferred_username", "sub"]
+  }
+}
+```
+
+In Keycloak mode, `GET /login` redirects to the OIDC authorization endpoint.
+`GET /login?local=1` still shows the local username/password form for dev and
+E2E smoke tests.
 
 Print environment variables for FastReAct and PSKA:
 
@@ -158,6 +179,8 @@ export PSKA_AUTH_MODE=trusted_headers
 - `GET /ready`
 - `GET /login`
 - `POST /login`
+- `GET /oidc/callback`
+- `GET /logout`
 - `POST /v1/auth/exchange`
 - `GET /v1/tenants`
 - `GET /v1/users`
@@ -167,9 +190,9 @@ export PSKA_AUTH_MODE=trusted_headers
 
 ## Browser login code flow
 
-For local browser smoke tests, AuthNode provides a small OAuth-like code flow.
-The browser never receives a PSKA/FastReAct service token, AuthNode admin token,
-or downstream JWT in JavaScript.
+For browser smoke tests, AuthNode provides a small OAuth-like code flow. The
+browser never receives a PSKA/FastReAct service token, AuthNode admin token, or
+downstream JWT in JavaScript.
 
 1. PSKA Gateway redirects an unauthenticated browser to:
 
@@ -177,11 +200,13 @@ or downstream JWT in JavaScript.
 http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
 ```
 
-2. AuthNode shows a local tenant/username/password login form and redirects
-   back to PSKA Gateway with a short-lived one-time `code`.
-3. PSKA Gateway calls `POST /v1/auth/exchange` server-side and receives an
+2. AuthNode either redirects to Keycloak and handles `/oidc/callback`, or shows
+   the local tenant/username/password form when using local mode or
+   `/login?local=1`.
+3. AuthNode redirects back to PSKA Gateway with a short-lived one-time `code`.
+4. PSKA Gateway calls `POST /v1/auth/exchange` server-side and receives an
    `aud=pska` JWT plus claims.
-4. PSKA Gateway stores only a signed HttpOnly session cookie in the browser and
+5. PSKA Gateway stores only a signed HttpOnly session cookie in the browser and
    proxies later API calls to PSKA with server-side identity material.
 
 `/v1/auth/exchange` is intentionally separate from `/v1/token`: it consumes only
@@ -259,11 +284,11 @@ silently creating local identities. In strict mode, `/v1/token` and
 
 ## Production direction
 
-For production, AuthNode still needs real login-management capabilities before
-it can stand in for a Keycloak-style system: user lifecycle management, password
-hashing and rotation, session revocation, MFA, audit logs, account disablement,
-tenant/user admin UI, and optional OIDC/SAML/LDAP federation. Keep the same
-downstream contract: verified JWTs or trusted headers carrying `sub`,
-`tenant_id`, `tenant_key`, roles, groups, and profile metadata. PSKA remains
+For production, Keycloak can own real login management: user lifecycle,
+password hashing and rotation, session revocation, MFA, audit logs, account
+disablement, tenant/user admin UI, and optional federation. AuthNode's
+production-shaped role is the OIDC broker and claim normalizer: it verifies
+Keycloak tokens, requires a tenant claim, maps user/tenant/roles/groups into the
+AuthNode contract, and emits downstream JWTs or trusted headers. PSKA remains
 responsible for knowledge ACLs; FastReAct remains responsible for
 workspace/tool policy.

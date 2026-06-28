@@ -7,9 +7,21 @@
   "token_ttl_seconds": 28800,
   "strict_identity": false,
   "admin_token": "",
+  "browser_login_provider": "local",
   "dev_login_password": "pska-local",
   "allow_unknown_users": true,
   "allow_unknown_tenants": true,
+  "keycloak": {
+    "issuer_url": "http://127.0.0.1:8080/realms/pska-local",
+    "client_id": "authnode",
+    "client_secret_env": "AUTHNODE_KEYCLOAK_CLIENT_SECRET",
+    "redirect_uri": "http://127.0.0.1:8788/oidc/callback",
+    "scopes": ["openid", "profile", "email"],
+    "tenant_claims": ["tenant_id", "tenant_key"],
+    "user_id_claims": ["preferred_username", "sub"],
+    "role_claims": ["roles", "realm_access.roles"],
+    "group_claims": ["groups"]
+  },
   "targets": {
     "fastreact": {
       "base_url": "http://127.0.0.1:8000",
