@@ -164,6 +164,17 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             _user_option(user, selected_user=requested_user, selected_tenant=requested_tenant)
             for user in users
         )
+        unknown_login = self.server.config.allow_unknown_users or self.server.config.allow_unknown_tenants
+        custom_identity = ""
+        if unknown_login:
+            requested_identity = ""
+            if requested_user:
+                requested_identity = f"{requested_user}|{requested_tenant or ''}".rstrip("|")
+            custom_identity = f"""
+      <label>Custom identity
+        <input name="custom_identity" placeholder="pska:user_key|tenant_key" value="{html.escape(requested_identity, quote=True)}">
+        <small>用于本地动态 tenant/user，例如 E2E 身份。留空则使用上面的 catalog identity。</small>
+      </label>"""
         body = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -177,7 +188,8 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
     h1 {{ margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }}
     p {{ margin: 0 0 20px; color: #666; line-height: 1.5; }}
     label {{ display: grid; gap: 8px; margin: 16px 0; font-size: 13px; color: #555; }}
-    select {{ min-height: 42px; border: 1px solid #cbc7ba; border-radius: 7px; padding: 0 12px; font: inherit; background: #fff; }}
+    select, input {{ min-height: 42px; border: 1px solid #cbc7ba; border-radius: 7px; padding: 0 12px; font: inherit; background: #fff; }}
+    small {{ color: #777; line-height: 1.4; }}
     button {{ width: 100%; height: 42px; margin-top: 8px; border: 0; border-radius: 7px; background: #245b52; color: white; font-weight: 700; cursor: pointer; }}
   </style>
 </head>
@@ -195,9 +207,21 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
           {options}
         </select>
       </label>
+      {custom_identity}
       <button type="submit">继续</button>
     </form>
   </main>
+  <script>
+    const form = document.querySelector("form");
+    form?.addEventListener("submit", () => {{
+      const custom = form.querySelector('[name="custom_identity"]');
+      const catalog = form.querySelector('[name="identity"]');
+      if (custom && catalog && custom.value.trim()) {{
+        catalog.disabled = true;
+        custom.name = "identity";
+      }}
+    }});
+  </script>
 </body>
 </html>"""
         self._html(body)

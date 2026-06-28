@@ -136,6 +136,8 @@ class AuthNodeTests(unittest.TestCase):
             with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
                 page = response.read().decode("utf-8")
             self.assertIn("pska:alice", page)
+            self.assertIn("Custom identity", page)
+            self.assertIn("pska:user_key|tenant_key", page)
 
             body = urlencode(
                 {
@@ -174,6 +176,30 @@ class AuthNodeTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as blocked:
                 urlopen(exchange_request, timeout=5)
             self.assertEqual(blocked.exception.code, 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_browser_login_hides_custom_identity_for_strict_catalog(self) -> None:
+        config = AuthNodeConfig.from_dict(
+            {
+                **CONFIG_DATA,
+                "strict_identity": True,
+                "allow_unknown_users": False,
+                "allow_unknown_tenants": False,
+            }
+        )
+        server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
+                page = response.read().decode("utf-8")
+            self.assertIn("pska:alice", page)
+            self.assertNotIn("Custom identity", page)
+            self.assertNotIn("pska:user_key|tenant_key", page)
         finally:
             server.shutdown()
             server.server_close()
