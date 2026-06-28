@@ -1,10 +1,11 @@
 # AuthNode
 
 AuthNode is a small local identity broker for FastReAct and PSKA development.
-It is intentionally not a full SSO product. Its job is to provide the same
+It is intentionally not a full SSO product yet. Its job is to provide the same
 identity contract that a future SSO gateway or identity broker would provide:
 
 - a local tenant/user catalog;
+- a local username/password login page for browser smoke tests;
 - HS256 JWTs accepted by FastReAct and PSKA;
 - trusted headers accepted by FastReAct and PSKA;
 - an optional local proxy that injects JWTs or trusted headers into upstream
@@ -13,7 +14,8 @@ identity contract that a future SSO gateway or identity broker would provide:
 ## Why this shape
 
 FastReAct and PSKA should not each grow their own password login, org admin
-console, or duplicate business ACL system. AuthNode sits at the local
+console, or duplicate business ACL system. AuthNode centralizes the local
+browser login and sits at the local
 development boundary:
 
 ```mermaid
@@ -48,6 +50,17 @@ On first run, `./start.sh` creates `authnode.local.json` and initializes local
 `jwt_secret`/`admin_token` automatically. For non-local use, inject the same JWT
 secret into AuthNode, FastReAct, and PSKA through deployment secrets or
 environment variables.
+
+For the browser flow, open PSKA and let it redirect to AuthNode, or visit:
+
+```text
+http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
+```
+
+The local login form asks for `tenant_id`, `username`, and `password`. Users can
+define their own `password`; unknown users in non-strict local mode can use
+`dev_login_password`. Keep these local passwords out of repository history when
+using a private `authnode.local.json`.
 
 Print environment variables for FastReAct and PSKA:
 
@@ -164,8 +177,8 @@ or downstream JWT in JavaScript.
 http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
 ```
 
-2. AuthNode shows the local user catalog and redirects back to PSKA Gateway with
-   a short-lived one-time `code`.
+2. AuthNode shows a local tenant/username/password login form and redirects
+   back to PSKA Gateway with a short-lived one-time `code`.
 3. PSKA Gateway calls `POST /v1/auth/exchange` server-side and receives an
    `aud=pska` JWT plus claims.
 4. PSKA Gateway stores only a signed HttpOnly session cookie in the browser and
@@ -246,8 +259,11 @@ silently creating local identities. In strict mode, `/v1/token` and
 
 ## Production direction
 
-For production, replace AuthNode's local catalog and demo login surface with a
-real OIDC/SAML/LDAP/customer-platform identity broker. Keep the same downstream
-contract: verified JWTs or trusted headers carrying `sub`, `tenant_id`,
-`tenant_key`, roles, groups, and profile metadata. PSKA remains responsible for
-knowledge ACLs; FastReAct remains responsible for workspace/tool policy.
+For production, AuthNode still needs real login-management capabilities before
+it can stand in for a Keycloak-style system: user lifecycle management, password
+hashing and rotation, session revocation, MFA, audit logs, account disablement,
+tenant/user admin UI, and optional OIDC/SAML/LDAP federation. Keep the same
+downstream contract: verified JWTs or trusted headers carrying `sub`,
+`tenant_id`, `tenant_key`, roles, groups, and profile metadata. PSKA remains
+responsible for knowledge ACLs; FastReAct remains responsible for
+workspace/tool policy.

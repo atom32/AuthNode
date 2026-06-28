@@ -156,25 +156,15 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         next_path = _first(params.get("next")) or "/"
         requested_user = _first(params.get("user_key"), params.get("user_id"))
         requested_tenant = _first(params.get("tenant_id"), params.get("tenant_key"))
-        users = [public_user(user) for user in self.server.config.users]
-        if not users:
-            default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
-            users = [public_user(default_user)]
-        options = "\n".join(
-            _user_option(user, selected_user=requested_user, selected_tenant=requested_tenant)
-            for user in users
+        default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
+        username = requested_user or default_user.user_id
+        if username.startswith("pska:"):
+            username = username.split(":", 1)[1]
+        tenant_value = requested_tenant or default_user.tenant_key or default_user.tenant_id
+        tenant_options = "\n".join(
+            f'<option value="{html.escape(tenant.tenant_key or tenant.tenant_id, quote=True)}">{html.escape(tenant.name or tenant.tenant_key or tenant.tenant_id)}</option>'
+            for tenant in self.server.config.tenants
         )
-        unknown_login = self.server.config.allow_unknown_users or self.server.config.allow_unknown_tenants
-        custom_identity = ""
-        if unknown_login:
-            requested_identity = ""
-            if requested_user:
-                requested_identity = f"{requested_user}|{requested_tenant or ''}".rstrip("|")
-            custom_identity = f"""
-      <label>Custom identity
-        <input name="custom_identity" placeholder="pska:user_key|tenant_key" value="{html.escape(requested_identity, quote=True)}">
-        <small>用于本地动态 tenant/user，例如 E2E 身份。留空则使用上面的 catalog identity。</small>
-      </label>"""
         body = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -196,32 +186,27 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
 <body>
   <main>
     <h1>AuthNode</h1>
-    <p>选择一个本地身份继续访问 {html.escape(target)}。这是开发用登录入口，不向浏览器暴露服务 token。</p>
+    <p>登录后继续访问 {html.escape(target)}。这是本地开发登录入口，不向浏览器暴露服务 token。</p>
     <form method="post" action="/login">
       <input type="hidden" name="target" value="{html.escape(target, quote=True)}">
       <input type="hidden" name="return_to" value="{html.escape(return_to, quote=True)}">
       <input type="hidden" name="next" value="{html.escape(next_path, quote=True)}">
       <input type="hidden" name="state" value="{html.escape(_first(params.get("state")) or "", quote=True)}">
-      <label>Identity
-        <select name="identity" required>
-          {options}
-        </select>
+      <label>Tenant
+        <input name="tenant_id" list="tenant-options" value="{html.escape(tenant_value, quote=True)}" autocomplete="organization" required>
+        <datalist id="tenant-options">
+          {tenant_options}
+        </datalist>
       </label>
-      {custom_identity}
-      <button type="submit">继续</button>
+      <label>Username
+        <input name="username" value="{html.escape(username, quote=True)}" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">登录</button>
     </form>
   </main>
-  <script>
-    const form = document.querySelector("form");
-    form?.addEventListener("submit", () => {{
-      const custom = form.querySelector('[name="custom_identity"]');
-      const catalog = form.querySelector('[name="identity"]');
-      if (custom && catalog && custom.value.trim()) {{
-        catalog.disabled = true;
-        custom.name = "identity";
-      }}
-    }});
-  </script>
 </body>
 </html>"""
         self._html(body)
@@ -229,13 +214,25 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
     def _handle_login_submit(self) -> None:
         form = self._form_body()
         identity = _first(form.get("identity"))
+        username = _first(form.get("username"), form.get("user_key"), form.get("user_id"))
+        tenant = _first(form.get("tenant_id"), form.get("tenant_key"))
+        password = _first(form.get("password")) or ""
         target = _first(form.get("target")) or "pska"
         return_to = _first(form.get("return_to"))
-        if not identity or not return_to:
-            self._error(HTTPStatus.BAD_REQUEST, "identity and return_to are required")
+        if not return_to:
+            self._error(HTTPStatus.BAD_REQUEST, "return_to is required")
             return
-        user_key, tenant = _split_identity(identity)
+        if identity:
+            user_key, tenant = _split_identity(identity)
+        else:
+            if not username:
+                self._error(HTTPStatus.BAD_REQUEST, "username is required")
+                return
+            user_key = username if ":" in username else f"pska:{username}"
         user = self.server.config.user_for(user_key, tenant_id_or_key=tenant)
+        if not _verify_login_password(self.server.config, user, password):
+            self._error(HTTPStatus.UNAUTHORIZED, "invalid username or password")
+            return
         tenant_item = self.server.config.tenant_for(tenant or user.tenant_id or user.tenant_key)
         code = self.server.issue_auth_code(
             user_key=user.user_key,
@@ -515,6 +512,13 @@ def _append_query(url: str, params: Mapping[str, str]) -> str:
 def _split_identity(value: str) -> tuple[str, str | None]:
     user_key, _, tenant = value.partition("|")
     return user_key.strip(), tenant.strip() or None
+
+
+def _verify_login_password(config: AuthNodeConfig, user: Any, password: str) -> bool:
+    expected = str(getattr(user, "password", "") or config.dev_login_password or "")
+    if not expected:
+        return False
+    return hmac.compare_digest(password, expected)
 
 
 def _user_option(user: Mapping[str, Any], *, selected_user: str | None, selected_tenant: str | None) -> str:

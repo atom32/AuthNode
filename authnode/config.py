@@ -24,6 +24,7 @@ class User:
     user_key: str
     tenant_id: str
     tenant_key: str
+    password: str = ""
     display_name: str = ""
     email: str = ""
     roles: tuple[str, ...] = field(default_factory=tuple)
@@ -49,6 +50,7 @@ class AuthNodeConfig:
     token_ttl_seconds: int = 28800
     strict_identity: bool = False
     admin_token: str | None = None
+    dev_login_password: str = ""
     allow_unknown_users: bool = True
     allow_unknown_tenants: bool = True
     tenants: tuple[Tenant, ...] = field(default_factory=tuple)
@@ -77,6 +79,7 @@ class AuthNodeConfig:
             token_ttl_seconds=int(data.get("token_ttl_seconds") or 28800),
             strict_identity=strict_identity,
             admin_token=_optional_string(data.get("admin_token")),
+            dev_login_password=str(data.get("dev_login_password") or data.get("local_login_password") or ""),
             allow_unknown_users=_bool(data.get("allow_unknown_users"), default=not strict_identity),
             allow_unknown_tenants=_bool(data.get("allow_unknown_tenants"), default=not strict_identity),
             tenants=tenants,
@@ -127,6 +130,7 @@ class AuthNodeConfig:
             user_key=user_key,
             tenant_id=tenant.tenant_id,
             tenant_key=tenant.tenant_key,
+            password=self.dev_login_password,
         )
 
     def target_for(self, name: str) -> Target:
@@ -193,6 +197,7 @@ def _user_from_dict(
         user_key=user_key,
         tenant_id=str(data.get("tenant_id") or tenant.tenant_id),
         tenant_key=str(data.get("tenant_key") or tenant.tenant_key),
+        password=str(data.get("password") or data.get("dev_password") or ""),
         display_name=str(data.get("display_name") or data.get("name") or user_id),
         email=str(data.get("email") or ""),
         roles=tuple(_string_list(data.get("roles"))),

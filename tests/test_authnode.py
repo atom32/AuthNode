@@ -17,6 +17,7 @@ from authnode.server import AuthNodeHTTPServer, AuthNodeHandler, proxy_forward_h
 CONFIG_DATA = {
     "jwt_secret": "test-secret",
     "issuer": "authnode.test",
+    "dev_login_password": "pska-local",
     "tenants": [{"tenant_id": "tenant_a", "tenant_key": "tenant_a"}],
     "users": [
         {
@@ -25,6 +26,7 @@ CONFIG_DATA = {
             "tenant_id": "tenant_a",
             "tenant_key": "tenant_a",
             "display_name": "Alice",
+            "password": "alice-local",
             "email": "alice@example.test",
             "roles": ["admin", "writer"],
             "groups": ["local"],
@@ -135,13 +137,15 @@ class AuthNodeTests(unittest.TestCase):
         try:
             with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
                 page = response.read().decode("utf-8")
-            self.assertIn("pska:alice", page)
-            self.assertIn("Custom identity", page)
-            self.assertIn("pska:user_key|tenant_key", page)
+            self.assertIn("Username", page)
+            self.assertIn("Password", page)
+            self.assertIn("tenant_a", page)
 
             body = urlencode(
                 {
-                    "identity": "pska:alice|tenant_a",
+                    "username": "alice",
+                    "tenant_id": "tenant_a",
+                    "password": "alice-local",
                     "target": "pska",
                     "return_to": "http://pska.local/auth/callback",
                     "next": "/",
@@ -181,25 +185,47 @@ class AuthNodeTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-    def test_browser_login_hides_custom_identity_for_strict_catalog(self) -> None:
-        config = AuthNodeConfig.from_dict(
-            {
-                **CONFIG_DATA,
-                "strict_identity": True,
-                "allow_unknown_users": False,
-                "allow_unknown_tenants": False,
-            }
-        )
-        server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+    def test_browser_login_rejects_bad_password(self) -> None:
+        server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, self.config)
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base_url = f"http://127.0.0.1:{server.server_address[1]}"
         try:
-            with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
-                page = response.read().decode("utf-8")
-            self.assertIn("pska:alice", page)
-            self.assertNotIn("Custom identity", page)
-            self.assertNotIn("pska:user_key|tenant_key", page)
+            body = urlencode(
+                {
+                    "username": "alice",
+                    "tenant_id": "tenant_a",
+                    "password": "wrong",
+                    "target": "pska",
+                    "return_to": "http://pska.local/auth/callback",
+                }
+            ).encode()
+            request = Request(
+                f"{base_url}/login",
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as blocked:
+                urlopen(request, timeout=5)
+            self.assertEqual(blocked.exception.code, 401)
+
+            legacy_body = urlencode(
+                {
+                    "identity": "pska:alice|tenant_a",
+                    "target": "pska",
+                    "return_to": "http://pska.local/auth/callback",
+                }
+            ).encode()
+            legacy_request = Request(
+                f"{base_url}/login",
+                data=legacy_body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as legacy_blocked:
+                urlopen(legacy_request, timeout=5)
+            self.assertEqual(legacy_blocked.exception.code, 401)
         finally:
             server.shutdown()
             server.server_close()
@@ -214,7 +240,9 @@ class AuthNodeTests(unittest.TestCase):
         try:
             body = urlencode(
                 {
-                    "identity": "pska:e2e-writer|tenant_dynamic",
+                    "username": "e2e-writer",
+                    "tenant_id": "tenant_dynamic",
+                    "password": "pska-local",
                     "target": "pska",
                     "return_to": "http://pska.local/auth/callback",
                     "next": "/",

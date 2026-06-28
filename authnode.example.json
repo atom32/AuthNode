@@ -7,6 +7,7 @@
   "token_ttl_seconds": 28800,
   "strict_identity": false,
   "admin_token": "",
+  "dev_login_password": "pska-local",
   "allow_unknown_users": true,
   "allow_unknown_tenants": true,
   "targets": {
@@ -38,6 +39,7 @@
       "tenant_id": "tenant_default",
       "tenant_key": "tenant_default",
       "display_name": "Primary Local User",
+      "password": "primary-local",
       "email": "primary@example.test",
       "roles": ["admin"],
       "groups": ["local"]
@@ -48,6 +50,7 @@
       "tenant_id": "tenant_acme",
       "tenant_key": "tenant_acme",
       "display_name": "Alice Acme",
+      "password": "alice-local",
       "email": "alice@example.test",
       "roles": ["writer"],
       "groups": ["acme"]

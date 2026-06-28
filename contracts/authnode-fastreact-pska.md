@@ -15,6 +15,10 @@ For PSKA implementation work, use
 AuthNode answers "who is this, and which tenant are they in?" It does not grant
 FastReAct workspace permissions or PSKA knowledge permissions.
 
+For local browser smoke tests, AuthNode owns the tenant/username/password login
+form and gives PSKA Gateway only a short-lived one-time code. PSKA Gateway
+exchanges that code server-side and stores a server-managed browser session.
+
 Startup remains independent: AuthNode, FastReAct, and PSKA are each started by
 their own script or container entrypoint. No project start script launches or
 reads another project's repository-local runtime config.

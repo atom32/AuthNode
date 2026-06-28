@@ -48,6 +48,12 @@ GET  /v1/headers
 ANY  /proxy/pska/{path}
 ```
 
+For local browser smoke tests, `GET /login` shows an AuthNode-owned
+tenant/username/password form and returns to PSKA Gateway with a short-lived
+one-time code. PSKA must consume the code server-side through
+`POST /v1/auth/exchange`; PSKA must not build its own password database or
+expose downstream JWT/service/admin tokens to browser JavaScript.
+
 If `admin_token` is configured, `/v1/token` and `/v1/headers` require either:
 
 ```http
