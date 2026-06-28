@@ -48,12 +48,14 @@ GET  /v1/headers
 ANY  /proxy/pska/{path}
 ```
 
-For browser smoke tests, `GET /login` is AuthNode-owned. In local mode it shows
-a tenant/username/password form; in Keycloak mode it redirects to OIDC and then
+For browser smoke tests, `GET /login` is AuthNode-owned. In Local IAM mode it
+authenticates against AuthNode's SQLite catalog with Argon2id password hashes
+and strict tenant membership. In Keycloak mode it redirects to OIDC and then
 handles `GET /oidc/callback`. `GET /login?local=1` keeps the local form for dev
 and E2E. PSKA must consume the returned one-time code server-side through
-`POST /v1/auth/exchange`; PSKA must not build its own password database or
-expose downstream JWT/service/admin tokens to browser JavaScript.
+`POST /v1/auth/exchange`; PSKA must not build its own password database, read
+AuthNode's catalog database, or expose downstream JWT/service/admin tokens to
+browser JavaScript.
 
 If `admin_token` is configured, `/v1/token` and `/v1/headers` require either:
 
@@ -192,6 +194,8 @@ This gateway must still treat AuthNode as the identity broker:
   JavaScript.
 - Keycloak tenant/user mapping is AuthNode's job. Missing tenant/user claims
   must fail closed before PSKA receives a session.
+- Local IAM tenant/user membership is AuthNode's job. PSKA should never infer or
+  create AuthNode users from payload fields.
 - PSKA Gateway may call AuthNode `POST /v1/auth/exchange` server-side to
   exchange a one-time browser login code for an `aud=pska` JWT and claims.
 - Browser JavaScript must never receive AuthNode admin tokens, PSKA service
@@ -226,8 +230,9 @@ PYTHONPATH=. python -m authnode contract pska:user_primary \
 ## Implementation Rules
 
 - Do not import AuthNode internals into PSKA runtime code.
-- Do not read `/Users/xudawei/Documents/AuthNode/authnode.local.json` from PSKA
-  application code. Use PSKA config/env instead.
+- Do not read `/Users/xudawei/Documents/AuthNode/authnode.local.json` or
+  AuthNode's SQLite catalog from PSKA application code. Use PSKA config/env
+  instead.
 - Do not start AuthNode or FastReAct from PSKA's startup script.
 - Do not store user passwords for this integration.
 - Do not expose AuthNode admin tokens, PSKA service tokens, FastReAct tokens, or

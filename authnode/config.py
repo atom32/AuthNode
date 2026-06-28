@@ -55,6 +55,23 @@ class KeycloakConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogStoreConfig:
+    type: str = "sqlite"
+    path: str = "./data/authnode.db"
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordPolicyConfig:
+    min_length: int = 10
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRateLimitConfig:
+    max_attempts: int = 5
+    window_seconds: int = 300
+
+
+@dataclass(frozen=True, slots=True)
 class AuthNodeConfig:
     host: str = "127.0.0.1"
     port: int = 8788
@@ -64,7 +81,13 @@ class AuthNodeConfig:
     token_ttl_seconds: int = 28800
     strict_identity: bool = False
     admin_token: str | None = None
+    identity_mode: str = "hybrid"
     browser_login_provider: str = "local"
+    strict_membership: bool = True
+    session_ttl_seconds: int = 28800
+    catalog_store: CatalogStoreConfig = field(default_factory=CatalogStoreConfig)
+    password_policy: PasswordPolicyConfig = field(default_factory=PasswordPolicyConfig)
+    login_rate_limit: LoginRateLimitConfig = field(default_factory=LoginRateLimitConfig)
     dev_login_password: str = ""
     allow_unknown_users: bool = True
     allow_unknown_tenants: bool = True
@@ -95,7 +118,13 @@ class AuthNodeConfig:
             token_ttl_seconds=int(data.get("token_ttl_seconds") or 28800),
             strict_identity=strict_identity,
             admin_token=_optional_string(data.get("admin_token")),
+            identity_mode=str(data.get("identity_mode") or "hybrid").strip().lower(),
             browser_login_provider=str(data.get("browser_login_provider") or "local").strip().lower(),
+            strict_membership=_bool(data.get("strict_membership"), default=True),
+            session_ttl_seconds=int(data.get("session_ttl_seconds") or data.get("token_ttl_seconds") or 28800),
+            catalog_store=_catalog_store_from_dict(data.get("catalog_store") or {}),
+            password_policy=_password_policy_from_dict(data.get("password_policy") or {}),
+            login_rate_limit=_login_rate_limit_from_dict(data.get("login_rate_limit") or {}),
             dev_login_password=str(data.get("dev_login_password") or data.get("local_login_password") or ""),
             allow_unknown_users=_bool(data.get("allow_unknown_users"), default=not strict_identity),
             allow_unknown_tenants=_bool(data.get("allow_unknown_tenants"), default=not strict_identity),
@@ -257,6 +286,36 @@ def _keycloak_from_dict(data: Any) -> KeycloakConfig:
         user_key_claims=tuple(_string_list(data.get("user_key_claims"))),
         role_claims=tuple(_string_list(data.get("role_claims"))) or ("roles", "realm_access.roles"),
         group_claims=tuple(_string_list(data.get("group_claims"))) or ("groups",),
+    )
+
+
+def _catalog_store_from_dict(data: Any) -> CatalogStoreConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("catalog_store config must be an object")
+    return CatalogStoreConfig(
+        type=str(data.get("type") or "sqlite").strip().lower(),
+        path=str(data.get("path") or "./data/authnode.db").strip(),
+    )
+
+
+def _password_policy_from_dict(data: Any) -> PasswordPolicyConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("password_policy config must be an object")
+    return PasswordPolicyConfig(min_length=int(data.get("min_length") or 10))
+
+
+def _login_rate_limit_from_dict(data: Any) -> LoginRateLimitConfig:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("login_rate_limit config must be an object")
+    return LoginRateLimitConfig(
+        max_attempts=int(data.get("max_attempts") or 5),
+        window_seconds=int(data.get("window_seconds") or 300),
     )
 
 

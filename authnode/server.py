@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
@@ -11,9 +12,10 @@ from threading import Lock
 import time
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from authnode.catalog import AuthCatalog, CatalogError, SESSION_COOKIE_NAME
 from authnode.config import AuthNodeConfig, Target, Tenant, User
 from authnode.identity import (
     issue_identity_token_for_user,
@@ -43,6 +45,9 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
         self.oidc_states: dict[str, dict[str, Any]] = {}
         self.oidc_states_lock = Lock()
         self.oidc_cache = OidcCache()
+        self.catalog = AuthCatalog(config)
+        if _uses_local_iam(config):
+            self.catalog.seed_from_config()
 
     def issue_auth_code(
         self,
@@ -148,10 +153,10 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                 self._json(self._ready_payload())
                 return
             if parsed.path == "/v1/tenants":
-                self._json({"tenants": [public_tenant(item) for item in self.server.config.tenants]})
+                self._json({"tenants": self._public_tenants()})
                 return
             if parsed.path == "/v1/users":
-                self._json({"users": [public_user(item) for item in self.server.config.users]})
+                self._json({"users": self._public_users()})
                 return
             if parsed.path == "/login" and self.command == "GET":
                 self._handle_login_form(parsed.query)
@@ -178,6 +183,11 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                     return
                 self._handle_headers(parsed.query)
                 return
+            if parsed.path.startswith("/v1/iam/"):
+                if not self._require_admin_auth():
+                    return
+                self._handle_iam(parsed)
+                return
             if parsed.path.startswith("/proxy/"):
                 self._handle_proxy(parsed)
                 return
@@ -196,13 +206,24 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         tenant = _first(body.get("tenant_id"), params.get("tenant_id"), body.get("tenant_key"), params.get("tenant_key"))
         audience = body.get("audience") or _first(params.get("audience"))
         ttl = body.get("ttl_seconds") or _first(params.get("ttl_seconds"))
-        token, claims = issue_identity_token(
-            self.server.config,
-            user_key,
-            tenant_id_or_key=tenant,
-            audience=audience,
-            ttl_seconds=int(ttl) if ttl else None,
-        )
+        resolved = self._catalog_identity(user_key, tenant)
+        if resolved is not None:
+            user, tenant_item = resolved
+            token, claims = issue_identity_token_for_user(
+                self.server.config,
+                user,
+                tenant=tenant_item,
+                audience=audience,
+                ttl_seconds=int(ttl) if ttl else None,
+            )
+        else:
+            token, claims = issue_identity_token(
+                self.server.config,
+                user_key,
+                tenant_id_or_key=tenant,
+                audience=audience,
+                ttl_seconds=int(ttl) if ttl else None,
+            )
         self._json(token_response(token, claims))
 
     def _handle_login_form(self, query: str) -> None:
@@ -233,17 +254,37 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                 return
             self._redirect(login_url)
             return
+        if self.server.config.browser_login_provider == "local_iam":
+            session = self._catalog_session()
+            if session is not None:
+                return self._redirect_to_return_to(
+                    return_to=return_to,
+                    target=target,
+                    state=_first(params.get("state")),
+                    next_path=next_path,
+                    user=session.user,
+                    tenant=session.tenant,
+                )
         requested_user = _first(params.get("user_key"), params.get("user_id"))
         requested_tenant = _first(params.get("tenant_id"), params.get("tenant_key"))
-        default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
-        username = requested_user or default_user.user_id
-        if username.startswith("pska:"):
-            username = username.split(":", 1)[1]
-        tenant_value = requested_tenant or default_user.tenant_key or default_user.tenant_id
-        tenant_options = "\n".join(
-            f'<option value="{html.escape(tenant.tenant_key or tenant.tenant_id, quote=True)}">{html.escape(tenant.name or tenant.tenant_key or tenant.tenant_id)}</option>'
-            for tenant in self.server.config.tenants
-        )
+        if self.server.config.browser_login_provider == "local_iam":
+            username = (requested_user or "").removeprefix("pska:")
+            tenants = self.server.catalog.list_tenants()
+            tenant_value = requested_tenant or (tenants[0]["tenant_id"] if tenants else "")
+            tenant_options = "\n".join(
+                f'<option value="{html.escape(str(tenant["tenant_id"]), quote=True)}">{html.escape(str(tenant.get("name") or tenant["tenant_id"]))}</option>'
+                for tenant in tenants
+            )
+        else:
+            default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
+            username = requested_user or default_user.user_id
+            if username.startswith("pska:"):
+                username = username.split(":", 1)[1]
+            tenant_value = requested_tenant or default_user.tenant_key or default_user.tenant_id
+            tenant_options = "\n".join(
+                f'<option value="{html.escape(tenant.tenant_key or tenant.tenant_id, quote=True)}">{html.escape(tenant.name or tenant.tenant_key or tenant.tenant_id)}</option>'
+                for tenant in self.server.config.tenants
+            )
         body = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -301,6 +342,34 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         if not return_to:
             self._error(HTTPStatus.BAD_REQUEST, "return_to is required")
             return
+        if self.server.config.browser_login_provider == "local_iam":
+            if not username or not tenant:
+                self._error(HTTPStatus.BAD_REQUEST, "username and tenant_id are required")
+                return
+            try:
+                user, tenant_item = self.server.catalog.authenticate(
+                    username=username,
+                    tenant_id=tenant,
+                    password=password,
+                    ip=self.client_address[0] if self.client_address else "",
+                )
+            except CatalogError as exc:
+                self._error(HTTPStatus.UNAUTHORIZED, str(exc))
+                return
+            session_token = self.server.catalog.create_session(
+                user=user,
+                tenant=tenant_item,
+                ttl_seconds=self.server.config.session_ttl_seconds,
+            )
+            return self._redirect_to_return_to(
+                return_to=return_to,
+                target=target,
+                state=_first(form.get("state")),
+                next_path=_first(form.get("next")),
+                user=user,
+                tenant=tenant_item,
+                session_token=session_token,
+            )
         if identity:
             user_key, tenant = _split_identity(identity)
         else:
@@ -378,13 +447,16 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
     def _handle_logout(self, query: str) -> None:
         params = parse_qs(query)
         return_to = _first(params.get("return_to")) or "/"
+        session_token = self._session_cookie()
+        if session_token:
+            self.server.catalog.revoke_session(session_token)
         if self.server.config.browser_login_provider == "keycloak":
             try:
-                self._redirect(logout_url(self.server.config, self.server.oidc_cache, return_to=return_to))
+                self._redirect(logout_url(self.server.config, self.server.oidc_cache, return_to=return_to), clear_session=True)
                 return
             except OidcError:
                 pass
-        self._redirect(return_to)
+        self._redirect(return_to, clear_session=True)
 
     def _handle_auth_exchange(self) -> None:
         body = self._json_body()
@@ -433,16 +505,126 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         target = _first(params.get("target")) or "both"
         mode = (_first(params.get("mode")) or "trusted_headers").strip().lower()
         if mode == "jwt":
-            token, claims = issue_identity_token(
-                self.server.config,
-                user_key,
-                tenant_id_or_key=tenant,
-                audience=None if target == "both" else target,
-            )
+            resolved = self._catalog_identity(user_key, tenant)
+            if resolved is not None:
+                user, tenant_item = resolved
+                token, claims = issue_identity_token_for_user(
+                    self.server.config,
+                    user,
+                    tenant=tenant_item,
+                    audience=None if target == "both" else target,
+                )
+            else:
+                token, claims = issue_identity_token(
+                    self.server.config,
+                    user_key,
+                    tenant_id_or_key=tenant,
+                    audience=None if target == "both" else target,
+                )
             self._json({"headers": {"Authorization": f"Bearer {token}"}, "claims": claims})
             return
-        headers = trusted_headers_for_user(self.server.config, user_key, tenant_id_or_key=tenant, target=target)
+        resolved = self._catalog_identity(user_key, tenant)
+        if resolved is not None:
+            user, tenant_item = resolved
+            headers = _trusted_headers_for_identity(user, tenant_item, target=target)
+        else:
+            headers = trusted_headers_for_user(self.server.config, user_key, tenant_id_or_key=tenant, target=target)
         self._json({"headers": headers})
+
+    def _handle_iam(self, parsed: Any) -> None:
+        parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
+        resource = parts[2] if len(parts) >= 3 else ""
+        params = parse_qs(parsed.query)
+        body = self._json_body() if self.command in {"POST", "PUT", "PATCH", "DELETE"} else {}
+        catalog = self.server.catalog
+        catalog.init()
+        try:
+            if resource == "tenants":
+                if self.command == "GET":
+                    include_disabled = _truthy(_first(params.get("include_disabled")))
+                    self._json({"tenants": catalog.list_tenants(include_disabled=include_disabled)})
+                    return
+                if self.command == "POST":
+                    catalog.create_tenant(
+                        str(body.get("tenant_id") or ""),
+                        tenant_key=_optional_body_string(body.get("tenant_key")),
+                        name=str(body.get("name") or ""),
+                    )
+                    self._json({"ok": True}, status=HTTPStatus.CREATED)
+                    return
+                if self.command == "DELETE":
+                    tenant_id = _first(parts[3] if len(parts) > 3 else None, params.get("tenant_id"), body.get("tenant_id"))
+                    catalog.disable_tenant(str(tenant_id or ""))
+                    self._json({"ok": True})
+                    return
+            if resource == "users":
+                if self.command == "GET":
+                    include_disabled = _truthy(_first(params.get("include_disabled")))
+                    self._json({"users": catalog.list_users(include_disabled=include_disabled)})
+                    return
+                if self.command == "POST":
+                    catalog.create_user(
+                        str(body.get("user_id") or body.get("user_key") or ""),
+                        display_name=str(body.get("display_name") or body.get("name") or ""),
+                        email=str(body.get("email") or ""),
+                        password=_optional_body_string(body.get("password")),
+                    )
+                    self._json({"ok": True}, status=HTTPStatus.CREATED)
+                    return
+                if self.command == "DELETE":
+                    user_id = _first(parts[3] if len(parts) > 3 else None, params.get("user_id"), body.get("user_id"))
+                    catalog.disable_user(str(user_id or ""))
+                    self._json({"ok": True})
+                    return
+            if resource == "memberships":
+                if self.command == "POST":
+                    catalog.add_membership(
+                        str(body.get("user_id") or body.get("user_key") or ""),
+                        str(body.get("tenant_id") or body.get("tenant_key") or ""),
+                        roles=_list_value(body.get("roles")),
+                        groups=_list_value(body.get("groups")),
+                    )
+                    self._json({"ok": True}, status=HTTPStatus.CREATED)
+                    return
+                if self.command == "DELETE":
+                    user_id = _first(params.get("user_id"), body.get("user_id"))
+                    tenant_id = _first(params.get("tenant_id"), body.get("tenant_id"))
+                    catalog.remove_membership(str(user_id or ""), str(tenant_id or ""))
+                    self._json({"ok": True})
+                    return
+            if resource == "roles":
+                if self.command == "POST":
+                    catalog.grant_role(
+                        str(body.get("user_id") or body.get("user_key") or ""),
+                        str(body.get("tenant_id") or body.get("tenant_key") or ""),
+                        str(body.get("role") or ""),
+                    )
+                    self._json({"ok": True}, status=HTTPStatus.CREATED)
+                    return
+                if self.command == "DELETE":
+                    user_id = _first(params.get("user_id"), body.get("user_id"))
+                    tenant_id = _first(params.get("tenant_id"), body.get("tenant_id"))
+                    role = _first(params.get("role"), body.get("role"))
+                    catalog.revoke_role(str(user_id or ""), str(tenant_id or ""), str(role or ""))
+                    self._json({"ok": True})
+                    return
+            if resource == "provider-accounts" and self.command == "POST":
+                catalog.link_provider_account(
+                    provider=str(body.get("provider") or ""),
+                    provider_subject=str(body.get("provider_subject") or body.get("subject") or ""),
+                    user_id=str(body.get("user_id") or body.get("user_key") or ""),
+                    tenant_id=str(body.get("tenant_id") or body.get("tenant_key") or ""),
+                )
+                self._json({"ok": True}, status=HTTPStatus.CREATED)
+                return
+            if resource == "audit" and self.command == "GET":
+                limit = int(_first(params.get("limit")) or 50)
+                self._json({"events": catalog.list_audit(limit=limit)})
+                return
+        except CatalogError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._error(HTTPStatus.NOT_FOUND, "unknown iam endpoint")
 
     def _handle_proxy(self, parsed: Any) -> None:
         rest = parsed.path[len("/proxy/") :]
@@ -477,14 +659,106 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_GATEWAY, f"upstream unavailable: {exc.reason}")
 
     def _proxy_headers(self, target: Target, *, user_key: str | None, tenant: str | None, mode: str | None) -> dict[str, str]:
-        injected_headers = outbound_headers_for_target(
-            self.server.config,
-            target,
-            user_key,
-            tenant_id_or_key=tenant,
-            mode=mode,
-        )
+        resolved = self._catalog_identity(user_key, tenant)
+        selected_mode = (mode or target.mode or "jwt").strip().lower()
+        if resolved is not None and selected_mode == "jwt":
+            user, tenant_item = resolved
+            token, _claims = issue_identity_token_for_user(
+                self.server.config,
+                user,
+                tenant=tenant_item,
+                audience=_target_audience(target.name),
+            )
+            injected_headers = {"Authorization": f"Bearer {token}"}
+        elif resolved is not None and selected_mode == "trusted_headers":
+            user, tenant_item = resolved
+            injected_headers = _trusted_headers_for_identity(user, tenant_item, target=target.name)
+        else:
+            injected_headers = outbound_headers_for_target(
+                self.server.config,
+                target,
+                user_key,
+                tenant_id_or_key=tenant,
+                mode=mode,
+            )
         return proxy_forward_headers(self.headers, injected_headers)
+
+    def _catalog_identity(self, user_key: str | None, tenant: str | None) -> tuple[User, Tenant] | None:
+        if not _catalog_lookup_enabled(self.server.config) or not user_key or not tenant:
+            return None
+        try:
+            return self.server.catalog.resolve_identity(user_key_or_id=user_key, tenant_id=tenant)
+        except CatalogError:
+            if self.server.config.browser_login_provider == "local_iam" or self.server.config.identity_mode == "local_iam":
+                raise
+            return None
+
+    def _catalog_session(self) -> Any | None:
+        if not _catalog_lookup_enabled(self.server.config):
+            return None
+        return self.server.catalog.session_for_token(self._session_cookie())
+
+    def _session_cookie(self) -> str | None:
+        cookie = SimpleCookie(self.headers.get("Cookie") or "")
+        morsel = cookie.get(SESSION_COOKIE_NAME)
+        return morsel.value if morsel else None
+
+    def _redirect_to_return_to(
+        self,
+        *,
+        return_to: str,
+        target: str,
+        state: str | None,
+        next_path: str | None,
+        user: User,
+        tenant: Tenant,
+        session_token: str | None = None,
+    ) -> None:
+        code = self.server.issue_auth_code(
+            user_key=user.user_key,
+            tenant=tenant.tenant_id,
+            target=target,
+            return_to=return_to,
+            state=state,
+            next_path=next_path,
+            identity=_identity_payload(user, tenant),
+        )
+        params = {"code": code}
+        if state:
+            params["state"] = state
+        if next_path:
+            params["next"] = next_path
+        self._redirect(_append_query(return_to, params), session_token=session_token)
+
+    def _public_tenants(self) -> list[dict[str, Any]]:
+        if _catalog_lookup_enabled(self.server.config):
+            try:
+                return [
+                    {"tenant_id": item["tenant_id"], "tenant_key": item["tenant_key"], "name": item["name"]}
+                    for item in self.server.catalog.list_tenants()
+                ]
+            except CatalogError:
+                pass
+        return [public_tenant(item) for item in self.server.config.tenants]
+
+    def _public_users(self) -> list[dict[str, Any]]:
+        if _catalog_lookup_enabled(self.server.config):
+            try:
+                return [
+                    {
+                        "user_id": item["user_id"],
+                        "user_key": item["user_key"],
+                        "display_name": item["display_name"],
+                        "email": item["email"],
+                        "roles": [],
+                        "groups": [],
+                        "provider": "authnode-local-iam",
+                    }
+                    for item in self.server.catalog.list_users()
+                ]
+            except CatalogError:
+                pass
+        return [public_user(item) for item in self.server.config.users]
 
     def _json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("content-length") or 0)
@@ -515,7 +789,14 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             "allow_unknown_users": config.allow_unknown_users,
             "allow_unknown_tenants": config.allow_unknown_tenants,
             "admin_token_configured": bool(config.admin_token),
+            "identity_mode": config.identity_mode,
             "browser_login_provider": config.browser_login_provider,
+            "strict_membership": config.strict_membership,
+            "catalog_store": {
+                "type": config.catalog_store.type,
+                "path": config.catalog_store.path,
+                "enabled": _catalog_lookup_enabled(config),
+            },
             "keycloak_configured": bool(config.keycloak.issuer_url and config.keycloak.client_id),
             "tenants": len(config.tenants),
             "users": len(config.users),
@@ -555,9 +836,20 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.FOUND) -> None:
+    def _redirect(
+        self,
+        location: str,
+        status: HTTPStatus = HTTPStatus.FOUND,
+        *,
+        session_token: str | None = None,
+        clear_session: bool = False,
+    ) -> None:
         self.send_response(status)
         self.send_header("location", location)
+        if session_token:
+            self.send_header("set-cookie", _session_cookie_header(session_token, max_age=self.server.config.session_ttl_seconds))
+        if clear_session:
+            self.send_header("set-cookie", _clear_session_cookie_header())
         self.send_header("content-length", "0")
         self.end_headers()
 
@@ -668,6 +960,54 @@ def _verify_login_password(config: AuthNodeConfig, user: Any, password: str) -> 
     return hmac.compare_digest(password, expected)
 
 
+def _uses_local_iam(config: AuthNodeConfig) -> bool:
+    return config.browser_login_provider == "local_iam"
+
+
+def _catalog_lookup_enabled(config: AuthNodeConfig) -> bool:
+    return config.identity_mode in {"local_iam", "hybrid"} and config.browser_login_provider == "local_iam"
+
+
+def _session_cookie_header(value: str, *, max_age: int) -> str:
+    return f"{SESSION_COOKIE_NAME}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={int(max_age)}"
+
+
+def _clear_session_cookie_header() -> str:
+    return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+
+def _trusted_headers_for_identity(user: User, tenant: Tenant, *, target: str) -> dict[str, str]:
+    selected = target.strip().lower()
+    headers: dict[str, str] = {}
+    if selected in {"fastreact", "both"}:
+        headers.update(
+            {
+                "X-FastReAct-User-Key": user.user_key,
+                "X-FastReAct-Tenant-Key": tenant.tenant_key,
+                "X-FastReAct-Subject": user.user_key,
+                "X-FastReAct-Display-Name": user.display_name,
+                "X-FastReAct-Email": user.email,
+                "X-FastReAct-Groups": ",".join(user.groups),
+                "X-FastReAct-Roles": ",".join(user.roles),
+                "X-FastReAct-Auth-Provider": user.provider,
+            }
+        )
+    if selected in {"pska", "both"}:
+        headers.update(
+            {
+                "X-PSKA-User-Id": user.user_id,
+                "X-PSKA-Tenant-Id": tenant.tenant_id,
+                "X-PSKA-Subject": user.user_key,
+                "X-PSKA-Display-Name": user.display_name,
+                "X-PSKA-Email": user.email,
+                "X-PSKA-Groups": ",".join(user.groups),
+                "X-PSKA-Roles": ",".join(user.roles),
+                "X-PSKA-Auth-Provider": user.provider,
+            }
+        )
+    return {key: value for key, value in headers.items() if value}
+
+
 def _identity_payload(user: User, tenant: Tenant) -> dict[str, Any]:
     return {
         "user_id": user.user_id,
@@ -722,6 +1062,13 @@ def _list_value(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()]
+
+
+def _optional_body_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _user_option(user: Mapping[str, Any], *, selected_user: str | None, selected_tenant: str | None) -> str:

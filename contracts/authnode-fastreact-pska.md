@@ -8,22 +8,34 @@ For PSKA implementation work, use
 
 ## Ownership
 
-- AuthNode owns identity proof and tenant/user mapping.
+- AuthNode owns identity proof and tenant/user mapping. It can prove identity
+  through its SQLite-backed Local IAM catalog or by adapting an external
+  provider such as Keycloak/OIDC.
 - FastReAct owns workspace isolation, tool policy, MCP routing, and audit.
 - PSKA owns knowledge ACLs and data-access decisions.
 
 AuthNode answers "who is this, and which tenant are they in?" It does not grant
 FastReAct workspace permissions or PSKA knowledge permissions.
 
-For browser smoke tests, AuthNode owns the login entrypoint. In local mode it
-shows a tenant/username/password form; in Keycloak mode it redirects to OIDC and
-handles `/oidc/callback`. In both modes it gives PSKA Gateway only a short-lived
+For browser smoke tests, AuthNode owns the login entrypoint. In Local IAM mode
+it authenticates against its SQLite catalog with Argon2id password hashes and
+strict membership checks; in Keycloak mode it redirects to OIDC and handles
+`/oidc/callback`. In both modes it gives PSKA Gateway only a short-lived
 one-time code. PSKA Gateway exchanges that code server-side and stores a
 server-managed browser session.
 
 In Keycloak mode, tenant identity must come from a verified token claim such as
 `tenant_id` or `tenant_key`. Missing tenant/user claims fail closed before
 AuthNode issues downstream PSKA/FastReAct credentials.
+
+In Local IAM mode, tenant identity must come from an active membership in the
+catalog. Disabled users, disabled tenants, missing memberships, and rate-limited
+login attempts fail closed before downstream credentials are issued.
+
+Local IAM administration belongs to AuthNode. The CLI and the admin-token
+protected `/v1/iam/*` JSON APIs may create tenants, users, memberships, role
+grants, provider account links, and audit queries. They must not mutate PSKA or
+FastReAct data.
 
 Startup remains independent: AuthNode, FastReAct, and PSKA are each started by
 their own script or container entrypoint. No project start script launches or

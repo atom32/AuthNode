@@ -5,9 +5,23 @@
   "issuer": "authnode.local",
   "default_audience": ["fastreact", "pska"],
   "token_ttl_seconds": 28800,
+  "session_ttl_seconds": 28800,
   "strict_identity": false,
   "admin_token": "",
-  "browser_login_provider": "local",
+  "identity_mode": "hybrid",
+  "browser_login_provider": "local_iam",
+  "strict_membership": true,
+  "catalog_store": {
+    "type": "sqlite",
+    "path": "./data/authnode.db"
+  },
+  "password_policy": {
+    "min_length": 10
+  },
+  "login_rate_limit": {
+    "max_attempts": 5,
+    "window_seconds": 300
+  },
   "dev_login_password": "pska-local",
   "allow_unknown_users": true,
   "allow_unknown_tenants": true,

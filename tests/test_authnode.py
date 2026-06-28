@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from threading import Thread
@@ -13,6 +15,7 @@ import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 
+from authnode.catalog import AuthCatalog, SESSION_COOKIE_NAME
 from authnode.config import AuthNodeConfig
 from authnode.contract import check_contract
 from authnode.identity import issue_identity_token, trusted_headers_for_user
@@ -474,6 +477,190 @@ class AuthNodeTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_local_iam_catalog_hashes_password_and_enforces_membership(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir)
+            catalog = AuthCatalog(config)
+            catalog.seed_from_config()
+
+            credential_hash = catalog.connect().execute(
+                "SELECT password_hash FROM user_credentials WHERE user_id = ?",
+                ("alice",),
+            ).fetchone()["password_hash"]
+            self.assertNotEqual(credential_hash, "alice-local")
+            self.assertIn("$argon2", credential_hash)
+
+            user, tenant = catalog.authenticate(username="alice", tenant_id="tenant_a", password="alice-local")
+            self.assertEqual(user.user_key, "pska:alice")
+            self.assertEqual(tenant.tenant_id, "tenant_a")
+
+            with self.assertRaisesRegex(Exception, "invalid username or password|unknown catalog identity"):
+                catalog.authenticate(username="alice", tenant_id="tenant_missing", password="alice-local")
+
+            catalog.set_password("alice", "changed-local")
+            with self.assertRaisesRegex(Exception, "invalid username or password"):
+                catalog.authenticate(username="alice", tenant_id="tenant_a", password="alice-local")
+            catalog.authenticate(username="alice", tenant_id="tenant_a", password="changed-local")
+
+            catalog.disable_user("alice")
+            with self.assertRaisesRegex(Exception, "invalid username or password"):
+                catalog.authenticate(username="alice", tenant_id="tenant_a", password="changed-local")
+
+    def test_local_iam_rate_limit_and_audit_events(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(
+                tmpdir,
+                {
+                    "login_rate_limit": {"max_attempts": 2, "window_seconds": 300},
+                },
+            )
+            catalog = AuthCatalog(config)
+            catalog.seed_from_config()
+
+            for _ in range(2):
+                with self.assertRaisesRegex(Exception, "invalid username or password"):
+                    catalog.authenticate(username="alice", tenant_id="tenant_a", password="wrong")
+            with self.assertRaisesRegex(Exception, "too many login attempts"):
+                catalog.authenticate(username="alice", tenant_id="tenant_a", password="alice-local")
+            events = catalog.list_audit(limit=10)
+            self.assertIn("login.rate_limited", {event["event_type"] for event in events})
+            self.assertIn("login.failure", {event["event_type"] for event in events})
+
+    def test_local_iam_browser_login_sets_authnode_session_and_reuses_it(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir)
+            server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            opener = build_opener(NoRedirectHandler)
+            try:
+                body = urlencode(
+                    {
+                        "username": "alice",
+                        "tenant_id": "tenant_a",
+                        "password": "alice-local",
+                        "target": "pska",
+                        "return_to": "http://pska.local/auth/callback",
+                        "next": "/",
+                    }
+                ).encode()
+                request = Request(
+                    f"{base_url}/login",
+                    data=body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                response = _open_no_redirect(opener, request)
+                self.assertEqual(response.code, 302)
+                session_cookie = response.headers["Set-Cookie"]
+                self.assertIn(SESSION_COOKIE_NAME, session_cookie)
+                code = parse_qs(urlsplit(response.headers["Location"]).query)["code"][0]
+
+                exchange_body = json.dumps({"code": code, "target": "pska"}).encode()
+                exchange_request = Request(
+                    f"{base_url}/v1/auth/exchange",
+                    data=exchange_body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(exchange_request, timeout=5) as exchange_response:
+                    exchanged = json.loads(exchange_response.read().decode("utf-8"))
+                decoded = decode_hs256(exchanged["access_token"], "test-secret", issuer="authnode.test", audience="pska")
+                self.assertEqual(decoded["provider"], "authnode-local-iam")
+                self.assertEqual(decoded["tenant_id"], "tenant_a")
+
+                cookie_value = session_cookie.split(";", 1)[0]
+                reuse_request = Request(
+                    f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback&next=%2Freuse",
+                    headers={"Cookie": cookie_value},
+                )
+                reused = _open_no_redirect(opener, reuse_request)
+                self.assertEqual(reused.code, 302)
+                self.assertEqual(parse_qs(urlsplit(reused.headers["Location"]).query)["next"], ["/reuse"])
+
+                logout = _open_no_redirect(opener, Request(f"{base_url}/logout?return_to=http%3A%2F%2Fpska.local%2Flogin", headers={"Cookie": cookie_value}))
+                self.assertEqual(logout.code, 302)
+                self.assertIn(f"{SESSION_COOKIE_NAME}=;", logout.headers["Set-Cookie"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_local_iam_provider_account_can_bind_external_identity_to_membership(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir)
+            catalog = AuthCatalog(config)
+            catalog.seed_from_config()
+            catalog.link_provider_account(
+                provider="keycloak",
+                provider_subject="external-subject",
+                user_id="alice",
+                tenant_id="tenant_a",
+            )
+
+            user, tenant = catalog.resolve_provider_identity(
+                provider="keycloak",
+                provider_subject="external-subject",
+                fallback_user_id="ignored",
+                tenant_id="tenant_a",
+            )
+            self.assertEqual(user.user_key, "pska:alice")
+            self.assertEqual(tenant.tenant_id, "tenant_a")
+
+    def test_local_iam_management_api_requires_admin_and_manages_catalog(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir, {"admin_token": "admin-secret", "strict_identity": True})
+            server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            headers = {"X-AuthNode-Admin-Token": "admin-secret"}
+            try:
+                with self.assertRaises(HTTPError) as blocked:
+                    urlopen(f"{base_url}/v1/iam/tenants", timeout=5)
+                self.assertEqual(blocked.exception.code, 401)
+
+                _json_request(
+                    f"{base_url}/v1/iam/tenants",
+                    {"tenant_id": "tenant_b", "name": "Tenant B"},
+                    headers=headers,
+                )
+                _json_request(
+                    f"{base_url}/v1/iam/users",
+                    {"user_id": "bob", "display_name": "Bob", "password": "bob-local12"},
+                    headers=headers,
+                )
+                _json_request(
+                    f"{base_url}/v1/iam/memberships",
+                    {"user_id": "bob", "tenant_id": "tenant_b", "roles": ["writer"], "groups": ["qa"]},
+                    headers=headers,
+                )
+                _json_request(
+                    f"{base_url}/v1/iam/roles",
+                    {"user_id": "bob", "tenant_id": "tenant_b", "role": "reviewer"},
+                    headers=headers,
+                )
+
+                with urlopen(Request(f"{base_url}/v1/iam/users", headers=headers), timeout=5) as response:
+                    users = json.loads(response.read().decode("utf-8"))["users"]
+                self.assertIn("bob", {user["user_id"] for user in users})
+
+                catalog_user, catalog_tenant = server.catalog.resolve_identity(user_key_or_id="bob", tenant_id="tenant_b")
+                self.assertEqual(catalog_user.user_key, "pska:bob")
+                self.assertEqual(catalog_tenant.tenant_id, "tenant_b")
+                self.assertIn("writer", catalog_user.roles)
+                self.assertIn("reviewer", catalog_user.roles)
+                self.assertIn("qa", catalog_user.groups)
+
+                with urlopen(Request(f"{base_url}/v1/iam/audit?limit=20", headers=headers), timeout=5) as response:
+                    events = json.loads(response.read().decode("utf-8"))["events"]
+                self.assertIn("membership.upsert", {event["event_type"] for event in events})
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_proxy_forward_headers_strip_spoofed_identity(self) -> None:
         forwarded = proxy_forward_headers(
             {
@@ -515,6 +702,17 @@ def _open_no_redirect(opener, request):  # noqa: ANN001 - urllib opener/response
         if 300 <= exc.code < 400:
             return exc
         raise
+
+
+def _json_request(url: str, payload: dict, *, headers: dict[str, str]) -> dict:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    with urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 class FakeResponse:
@@ -586,6 +784,20 @@ def keycloak_config() -> AuthNodeConfig:
             },
         }
     )
+
+
+def local_iam_config(tmpdir: str, extra: dict | None = None) -> AuthNodeConfig:
+    data = {
+        **CONFIG_DATA,
+        "browser_login_provider": "local_iam",
+        "identity_mode": "hybrid",
+        "strict_membership": True,
+        "session_ttl_seconds": 600,
+        "catalog_store": {"type": "sqlite", "path": "authnode-test.db"},
+        "password_policy": {"min_length": 10},
+    }
+    data.update(extra or {})
+    return AuthNodeConfig.from_dict(data, source_path=Path(tmpdir) / "authnode.test.json")
 
 
 def rsa_key(kid: str):

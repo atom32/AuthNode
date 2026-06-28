@@ -4,8 +4,8 @@ AuthNode is a small local identity broker for FastReAct and PSKA development.
 It is intentionally not a full SSO product yet. Its job is to provide the same
 identity contract that a future SSO gateway or identity broker would provide:
 
-- a local tenant/user catalog;
-- a local username/password login page for browser smoke tests;
+- a SQLite-backed Local IAM catalog for environments without SSO;
+- a local JSON username/password dev login for smoke tests;
 - a Keycloak/OIDC browser login broker for production-like tests;
 - HS256 JWTs accepted by FastReAct and PSKA;
 - trusted headers accepted by FastReAct and PSKA;
@@ -58,10 +58,31 @@ For the browser flow, open PSKA and let it redirect to AuthNode, or visit:
 http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
 ```
 
-By default the example config uses local login. The local login form asks for
-`tenant_id`, `username`, and `password`; unknown users in non-strict local mode
-can use `dev_login_password`. Keep these local passwords out of repository
-history when using a private `authnode.local.json`.
+By default the example config uses `browser_login_provider=local_iam`.
+Initialize the SQLite catalog and seed the example tenants/users with:
+
+```bash
+python -m authnode --config authnode.local.json iam init --seed-config
+```
+
+Local IAM stores passwords as Argon2id hashes in `./data/authnode.db`, enforces
+tenant membership, writes audit events, and sets an AuthNode HttpOnly login
+session. The JSON `users` array is only a seed/dev fallback, not the formal
+account database.
+
+Useful Local IAM commands:
+
+```bash
+python -m authnode --config authnode.local.json tenant create tenant_demo --name "Demo Tenant"
+python -m authnode --config authnode.local.json user create demo_user --password 'change-me-now' --email demo@example.test
+python -m authnode --config authnode.local.json membership add demo_user tenant_demo --roles writer --groups local
+python -m authnode --config authnode.local.json audit list --limit 20
+```
+
+Existing private configs can keep `browser_login_provider=local` to use the old
+JSON dev login. In that mode the local form asks for `tenant_id`, `username`,
+and `password`; unknown users in non-strict local mode can use
+`dev_login_password`.
 
 To send normal browser login through Keycloak, set:
 
@@ -186,7 +207,41 @@ export PSKA_AUTH_MODE=trusted_headers
 - `GET /v1/users`
 - `POST /v1/token`
 - `GET /v1/headers`
+- `GET/POST/DELETE /v1/iam/tenants`
+- `GET/POST/DELETE /v1/iam/users`
+- `POST/DELETE /v1/iam/memberships`
+- `POST/DELETE /v1/iam/roles`
+- `POST /v1/iam/provider-accounts`
+- `GET /v1/iam/audit`
 - `ANY /proxy/{target}/{path}`
+
+## Local IAM catalog
+
+Local IAM is the no-Keycloak fallback. It is intentionally smaller than
+Keycloak, but it is operationally real enough to run PSKA/FastReAct:
+
+- SQLite catalog at `catalog_store.path`;
+- Argon2id password hashes;
+- tenant/user/membership/role/group records;
+- AuthNode HttpOnly sessions;
+- login failure rate limiting;
+- audit events for login, user, tenant, membership, role, provider, and session
+  operations.
+
+The CLI manages the catalog directly and does not modify PSKA/FastReAct data:
+
+```bash
+python -m authnode iam init --seed-config
+python -m authnode tenant list
+python -m authnode user list
+python -m authnode user reset-password alice --password 'new-password'
+python -m authnode role grant alice tenant_acme admin
+```
+
+The same catalog operations are available as admin-token protected local JSON
+APIs under `/v1/iam/*`. They are not browser UI endpoints; they are meant for
+automation or a future management surface. They require `X-AuthNode-Admin-Token`
+or `Authorization: Bearer <admin-token>` when `admin_token` is configured.
 
 ## Browser login code flow
 
@@ -200,9 +255,9 @@ downstream JWT in JavaScript.
 http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
 ```
 
-2. AuthNode either redirects to Keycloak and handles `/oidc/callback`, or shows
-   the local tenant/username/password form when using local mode or
-   `/login?local=1`.
+2. AuthNode either uses Local IAM, redirects to Keycloak and handles
+   `/oidc/callback`, or shows the legacy JSON dev form when using
+   `browser_login_provider=local` or `/login?local=1`.
 3. AuthNode redirects back to PSKA Gateway with a short-lived one-time `code`.
 4. PSKA Gateway calls `POST /v1/auth/exchange` server-side and receives an
    `aud=pska` JWT plus claims.
@@ -284,11 +339,12 @@ silently creating local identities. In strict mode, `/v1/token` and
 
 ## Production direction
 
-For production, Keycloak can own real login management: user lifecycle,
-password hashing and rotation, session revocation, MFA, audit logs, account
-disablement, tenant/user admin UI, and optional federation. AuthNode's
-production-shaped role is the OIDC broker and claim normalizer: it verifies
-Keycloak tokens, requires a tenant claim, maps user/tenant/roles/groups into the
-AuthNode contract, and emits downstream JWTs or trusted headers. PSKA remains
+AuthNode can run in two production-shaped roles. Without a customer SSO, Local
+IAM owns the tenant/user catalog, password hashes, browser sessions, membership
+checks, and audit events. With Keycloak, Okta, Azure AD, SAML, LDAP, or a
+customer-specific identity system, AuthNode should act as the adapter/broker:
+verify the upstream identity, require tenant/user mapping, normalize
+roles/groups/profile claims, optionally bind the external subject to a Local IAM
+membership, and emit the same downstream JWTs or trusted headers. PSKA remains
 responsible for knowledge ACLs; FastReAct remains responsible for
 workspace/tool policy.
