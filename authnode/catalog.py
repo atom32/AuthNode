@@ -114,6 +114,11 @@ class AuthCatalog:
             conn.execute("UPDATE tenants SET disabled = 1, updated_at = ? WHERE tenant_id = ?", (_now(), tenant_id))
             self.audit("tenant.disable", actor="admin-cli", tenant_id=tenant_id, target=tenant_id, conn=conn)
 
+    def enable_tenant(self, tenant_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE tenants SET disabled = 0, updated_at = ? WHERE tenant_id = ?", (_now(), tenant_id))
+            self.audit("tenant.enable", actor="admin-cli", tenant_id=tenant_id, target=tenant_id, conn=conn)
+
     def create_user(
         self,
         user_id: str,
@@ -162,6 +167,12 @@ class AuthCatalog:
         with self.connect() as conn:
             conn.execute("UPDATE users SET disabled = 1, updated_at = ? WHERE user_id = ?", (_now(), user_id))
             self.audit("user.disable", actor="admin-cli", target=f"pska:{user_id}", conn=conn)
+
+    def enable_user(self, user_id: str) -> None:
+        user_id = user_id.removeprefix("pska:")
+        with self.connect() as conn:
+            conn.execute("UPDATE users SET disabled = 0, updated_at = ? WHERE user_id = ?", (_now(), user_id))
+            self.audit("user.enable", actor="admin-cli", target=f"pska:{user_id}", conn=conn)
 
     def set_password(self, user_id: str, password: str, *, conn: sqlite3.Connection | None = None) -> None:
         user_id = user_id.removeprefix("pska:")
@@ -230,11 +241,45 @@ class AuthCatalog:
             )
             self.audit("membership.disable", actor="admin-cli", tenant_id=tenant_id, target=f"pska:{user_id}", conn=conn)
 
+    def list_memberships(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        query = """
+            SELECT m.user_id, u.user_key, u.display_name, u.email,
+                   t.tenant_id, t.tenant_key, t.name AS tenant_name,
+                   m.disabled AS membership_disabled,
+                   u.disabled AS user_disabled,
+                   t.disabled AS tenant_disabled,
+                   m.created_at, m.updated_at,
+                   COALESCE(GROUP_CONCAT(DISTINCT mr.role), '') AS roles,
+                   COALESCE(GROUP_CONCAT(DISTINCT mg.group_name), '') AS groups
+            FROM memberships m
+            JOIN users u ON u.user_id = m.user_id
+            JOIN tenants t ON t.tenant_id = m.tenant_id
+            LEFT JOIN membership_roles mr ON mr.user_id = m.user_id AND mr.tenant_id = m.tenant_id
+            LEFT JOIN membership_groups mg ON mg.user_id = m.user_id AND mg.tenant_id = m.tenant_id
+        """
+        if not include_disabled:
+            query += " WHERE m.disabled = 0 AND u.disabled = 0 AND t.disabled = 0"
+        query += " GROUP BY m.user_id, m.tenant_id ORDER BY t.tenant_id, u.user_id"
+        with self.connect() as conn:
+            result = []
+            for row in conn.execute(query):
+                item = dict(row)
+                item["roles"] = _split_csv(item.get("roles"))
+                item["groups"] = _split_csv(item.get("groups"))
+                result.append(item)
+            return result
+
     def grant_role(self, user_id: str, tenant_id: str, role: str) -> None:
         self._add_assignment("membership_roles", user_id, tenant_id, "role", role, "role.grant")
 
     def revoke_role(self, user_id: str, tenant_id: str, role: str) -> None:
         self._remove_assignment("membership_roles", user_id, tenant_id, "role", role, "role.revoke")
+
+    def grant_group(self, user_id: str, tenant_id: str, group: str) -> None:
+        self._add_assignment("membership_groups", user_id, tenant_id, "group_name", group, "group.grant")
+
+    def revoke_group(self, user_id: str, tenant_id: str, group: str) -> None:
+        self._remove_assignment("membership_groups", user_id, tenant_id, "group_name", group, "group.revoke")
 
     def authenticate(self, *, username: str, tenant_id: str, password: str, ip: str = "") -> tuple[User, Tenant]:
         username = _required(username, "username")

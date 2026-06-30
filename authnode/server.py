@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import hmac
 import html
 import json
@@ -36,12 +37,17 @@ from authnode.oidc import (
 )
 
 
+ADMIN_SESSION_COOKIE_NAME = "authnode_admin"
+
+
 class AuthNodeHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], RequestHandlerClass: type[BaseHTTPRequestHandler], config: AuthNodeConfig):
         super().__init__(server_address, RequestHandlerClass)
         self.config = config
         self.auth_codes: dict[str, dict[str, Any]] = {}
         self.auth_codes_lock = Lock()
+        self.admin_sessions: dict[str, float] = {}
+        self.admin_sessions_lock = Lock()
         self.oidc_states: dict[str, dict[str, Any]] = {}
         self.oidc_states_lock = Lock()
         self.oidc_cache = OidcCache()
@@ -83,6 +89,32 @@ class AuthNodeHTTPServer(ThreadingHTTPServer):
         if time.time() >= float(payload.get("exp") or 0):
             return None
         return payload
+
+    def issue_admin_session(self) -> str:
+        token = secrets.token_urlsafe(32)
+        expires_at = time.time() + int(self.config.session_ttl_seconds)
+        with self.admin_sessions_lock:
+            self.admin_sessions[_admin_session_hash(token)] = expires_at
+        return token
+
+    def admin_session_valid(self, token: str | None) -> bool:
+        if not token:
+            return False
+        key = _admin_session_hash(token)
+        with self.admin_sessions_lock:
+            expires_at = self.admin_sessions.get(key)
+            if not expires_at:
+                return False
+            if time.time() >= expires_at:
+                self.admin_sessions.pop(key, None)
+                return False
+            return True
+
+    def revoke_admin_session(self, token: str | None) -> None:
+        if not token:
+            return
+        with self.admin_sessions_lock:
+            self.admin_sessions.pop(_admin_session_hash(token), None)
 
     def issue_oidc_state(
         self,
@@ -152,6 +184,21 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             if parsed.path == "/ready":
                 self._json(self._ready_payload())
                 return
+            if parsed.path == "/admin" and self.command == "GET":
+                self._handle_admin_home(parsed.query)
+                return
+            if parsed.path == "/admin/login" and self.command == "GET":
+                self._handle_admin_login_form()
+                return
+            if parsed.path == "/admin/login" and self.command == "POST":
+                self._handle_admin_login_submit()
+                return
+            if parsed.path == "/admin/action" and self.command == "POST":
+                self._handle_admin_action()
+                return
+            if parsed.path == "/admin/logout" and self.command in {"GET", "POST"}:
+                self._handle_admin_logout()
+                return
             if parsed.path == "/v1/tenants":
                 self._json({"tenants": self._public_tenants()})
                 return
@@ -198,6 +245,110 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def _handle_admin_home(self, query: str) -> None:
+        if not self._admin_session_valid():
+            self._redirect("/admin/login")
+            return
+        params = parse_qs(query)
+        catalog = self.server.catalog
+        catalog.init()
+        self._html(
+            _admin_dashboard_html(
+                tenants=catalog.list_tenants(include_disabled=True),
+                users=catalog.list_users(include_disabled=True),
+                memberships=catalog.list_memberships(include_disabled=True),
+                events=catalog.list_audit(limit=30),
+                status=_first(params.get("status")),
+                error=_first(params.get("error")),
+            )
+        )
+
+    def _handle_admin_login_form(self) -> None:
+        if self._admin_session_valid():
+            self._redirect("/admin")
+            return
+        self._html(_admin_login_html())
+
+    def _handle_admin_login_submit(self) -> None:
+        if not self.server.config.admin_token:
+            self._html(_admin_login_html("admin_token is required before using local admin."), status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        form = self._form_body()
+        provided = _first(form.get("admin_token")) or ""
+        if not hmac.compare_digest(provided, self.server.config.admin_token):
+            self.server.catalog.init()
+            self.server.catalog.audit("admin.login_failed", actor="admin-ui")
+            self._html(_admin_login_html("invalid admin token"), status=HTTPStatus.UNAUTHORIZED)
+            return
+        session_token = self.server.issue_admin_session()
+        self.server.catalog.init()
+        self.server.catalog.audit("admin.login", actor="admin-ui")
+        self._redirect("/admin", admin_session_token=session_token)
+
+    def _handle_admin_logout(self) -> None:
+        self.server.revoke_admin_session(self._admin_session_cookie())
+        self.server.catalog.init()
+        self.server.catalog.audit("admin.logout", actor="admin-ui")
+        self._redirect("/admin/login", clear_admin_session=True)
+
+    def _handle_admin_action(self) -> None:
+        if not self._admin_session_valid():
+            self._redirect("/admin/login")
+            return
+        form = self._form_body()
+        action = _first(form.get("action")) or ""
+        catalog = self.server.catalog
+        catalog.init()
+        try:
+            if action == "tenant.create":
+                catalog.create_tenant(
+                    str(_first(form.get("tenant_id")) or ""),
+                    tenant_key=_first(form.get("tenant_key")),
+                    name=str(_first(form.get("name")) or ""),
+                )
+                return self._admin_done("tenant saved")
+            if action == "tenant.enable":
+                catalog.enable_tenant(str(_first(form.get("tenant_id")) or ""))
+                return self._admin_done("tenant enabled")
+            if action == "tenant.disable":
+                catalog.disable_tenant(str(_first(form.get("tenant_id")) or ""))
+                return self._admin_done("tenant disabled")
+            if action == "user.create":
+                catalog.create_user(
+                    str(_first(form.get("user_id")) or ""),
+                    display_name=str(_first(form.get("display_name")) or ""),
+                    email=str(_first(form.get("email")) or ""),
+                    password=_first(form.get("password")),
+                )
+                return self._admin_done("user saved")
+            if action == "user.password":
+                catalog.set_password(str(_first(form.get("user_id")) or ""), str(_first(form.get("password")) or ""))
+                return self._admin_done("password reset")
+            if action == "user.enable":
+                catalog.enable_user(str(_first(form.get("user_id")) or ""))
+                return self._admin_done("user enabled")
+            if action == "user.disable":
+                catalog.disable_user(str(_first(form.get("user_id")) or ""))
+                return self._admin_done("user disabled")
+            if action == "membership.save":
+                catalog.add_membership(
+                    str(_first(form.get("user_id")) or ""),
+                    str(_first(form.get("tenant_id")) or ""),
+                    roles=_list_value(_first(form.get("roles"))),
+                    groups=_list_value(_first(form.get("groups"))),
+                )
+                return self._admin_done("membership saved")
+            if action == "membership.remove":
+                catalog.remove_membership(str(_first(form.get("user_id")) or ""), str(_first(form.get("tenant_id")) or ""))
+                return self._admin_done("membership removed")
+            self._admin_done("", error="unknown admin action")
+        except CatalogError as exc:
+            self._admin_done("", error=str(exc))
+
+    def _admin_done(self, status: str, *, error: str = "") -> None:
+        params = {"error": error} if error else {"status": status}
+        self._redirect(_append_query("/admin", params))
 
     def _handle_token(self, query: str) -> None:
         params = parse_qs(query)
@@ -540,6 +691,17 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         catalog.init()
         try:
             if resource == "tenants":
+                tenant_id = _first(parts[3] if len(parts) > 3 else None, params.get("tenant_id"), body.get("tenant_id"))
+                tenant_action = parts[4] if len(parts) > 4 else ""
+                if tenant_action and self.command in {"POST", "PATCH"}:
+                    if tenant_action == "enable":
+                        catalog.enable_tenant(str(tenant_id or ""))
+                        self._json({"ok": True})
+                        return
+                    if tenant_action == "disable":
+                        catalog.disable_tenant(str(tenant_id or ""))
+                        self._json({"ok": True})
+                        return
                 if self.command == "GET":
                     include_disabled = _truthy(_first(params.get("include_disabled")))
                     self._json({"tenants": catalog.list_tenants(include_disabled=include_disabled)})
@@ -552,12 +714,33 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                     )
                     self._json({"ok": True}, status=HTTPStatus.CREATED)
                     return
+                if self.command == "PATCH":
+                    if _body_bool(body.get("disabled")):
+                        catalog.disable_tenant(str(tenant_id or ""))
+                    else:
+                        catalog.enable_tenant(str(tenant_id or ""))
+                    self._json({"ok": True})
+                    return
                 if self.command == "DELETE":
-                    tenant_id = _first(parts[3] if len(parts) > 3 else None, params.get("tenant_id"), body.get("tenant_id"))
                     catalog.disable_tenant(str(tenant_id or ""))
                     self._json({"ok": True})
                     return
             if resource == "users":
+                user_id = _first(parts[3] if len(parts) > 3 else None, params.get("user_id"), body.get("user_id"), body.get("user_key"))
+                user_action = parts[4] if len(parts) > 4 else ""
+                if user_action and self.command in {"POST", "PATCH"}:
+                    if user_action == "enable":
+                        catalog.enable_user(str(user_id or ""))
+                        self._json({"ok": True})
+                        return
+                    if user_action == "disable":
+                        catalog.disable_user(str(user_id or ""))
+                        self._json({"ok": True})
+                        return
+                    if user_action == "password":
+                        catalog.set_password(str(user_id or ""), str(body.get("password") or ""))
+                        self._json({"ok": True})
+                        return
                 if self.command == "GET":
                     include_disabled = _truthy(_first(params.get("include_disabled")))
                     self._json({"users": catalog.list_users(include_disabled=include_disabled)})
@@ -571,12 +754,24 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                     )
                     self._json({"ok": True}, status=HTTPStatus.CREATED)
                     return
+                if self.command == "PATCH":
+                    if "password" in body:
+                        catalog.set_password(str(user_id or ""), str(body.get("password") or ""))
+                    elif _body_bool(body.get("disabled")):
+                        catalog.disable_user(str(user_id or ""))
+                    else:
+                        catalog.enable_user(str(user_id or ""))
+                    self._json({"ok": True})
+                    return
                 if self.command == "DELETE":
-                    user_id = _first(parts[3] if len(parts) > 3 else None, params.get("user_id"), body.get("user_id"))
                     catalog.disable_user(str(user_id or ""))
                     self._json({"ok": True})
                     return
             if resource == "memberships":
+                if self.command == "GET":
+                    include_disabled = _truthy(_first(params.get("include_disabled")))
+                    self._json({"memberships": catalog.list_memberships(include_disabled=include_disabled)})
+                    return
                 if self.command == "POST":
                     catalog.add_membership(
                         str(body.get("user_id") or body.get("user_key") or ""),
@@ -606,6 +801,22 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                     tenant_id = _first(params.get("tenant_id"), body.get("tenant_id"))
                     role = _first(params.get("role"), body.get("role"))
                     catalog.revoke_role(str(user_id or ""), str(tenant_id or ""), str(role or ""))
+                    self._json({"ok": True})
+                    return
+            if resource == "groups":
+                if self.command == "POST":
+                    catalog.grant_group(
+                        str(body.get("user_id") or body.get("user_key") or ""),
+                        str(body.get("tenant_id") or body.get("tenant_key") or ""),
+                        str(body.get("group") or body.get("group_name") or ""),
+                    )
+                    self._json({"ok": True}, status=HTTPStatus.CREATED)
+                    return
+                if self.command == "DELETE":
+                    user_id = _first(params.get("user_id"), body.get("user_id"))
+                    tenant_id = _first(params.get("tenant_id"), body.get("tenant_id"))
+                    group = _first(params.get("group"), params.get("group_name"), body.get("group"), body.get("group_name"))
+                    catalog.revoke_group(str(user_id or ""), str(tenant_id or ""), str(group or ""))
                     self._json({"ok": True})
                     return
             if resource == "provider-accounts" and self.command == "POST":
@@ -698,9 +909,17 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             return None
         return self.server.catalog.session_for_token(self._session_cookie())
 
+    def _admin_session_valid(self) -> bool:
+        return self.server.admin_session_valid(self._admin_session_cookie())
+
     def _session_cookie(self) -> str | None:
         cookie = SimpleCookie(self.headers.get("Cookie") or "")
         morsel = cookie.get(SESSION_COOKIE_NAME)
+        return morsel.value if morsel else None
+
+    def _admin_session_cookie(self) -> str | None:
+        cookie = SimpleCookie(self.headers.get("Cookie") or "")
+        morsel = cookie.get(ADMIN_SESSION_COOKIE_NAME)
         return morsel.value if morsel else None
 
     def _redirect_to_return_to(
@@ -792,6 +1011,7 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             "identity_mode": config.identity_mode,
             "browser_login_provider": config.browser_login_provider,
             "strict_membership": config.strict_membership,
+            "admin_url": "/admin",
             "catalog_store": {
                 "type": config.catalog_store.type,
                 "path": config.catalog_store.path,
@@ -843,6 +1063,8 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
         *,
         session_token: str | None = None,
         clear_session: bool = False,
+        admin_session_token: str | None = None,
+        clear_admin_session: bool = False,
     ) -> None:
         self.send_response(status)
         self.send_header("location", location)
@@ -850,6 +1072,10 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             self.send_header("set-cookie", _session_cookie_header(session_token, max_age=self.server.config.session_ttl_seconds))
         if clear_session:
             self.send_header("set-cookie", _clear_session_cookie_header())
+        if admin_session_token:
+            self.send_header("set-cookie", _admin_session_cookie_header(admin_session_token, max_age=self.server.config.session_ttl_seconds))
+        if clear_admin_session:
+            self.send_header("set-cookie", _clear_admin_session_cookie_header())
         self.send_header("content-length", "0")
         self.end_headers()
 
@@ -976,6 +1202,230 @@ def _clear_session_cookie_header() -> str:
     return f"{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
 
 
+def _admin_session_cookie_header(value: str, *, max_age: int) -> str:
+    return f"{ADMIN_SESSION_COOKIE_NAME}={value}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age={int(max_age)}"
+
+
+def _clear_admin_session_cookie_header() -> str:
+    return f"{ADMIN_SESSION_COOKIE_NAME}=; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0"
+
+
+def _admin_session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _admin_login_html(error: str = "") -> str:
+    message = f'<p class="error">{_e(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuthNode Admin</title>
+  <style>{_admin_css()}</style>
+</head>
+<body>
+  <main class="login-shell">
+    <h1>AuthNode Admin</h1>
+    {message}
+    <form method="post" action="/admin/login">
+      <label>Admin token
+        <input name="admin_token" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
+def _admin_dashboard_html(
+    *,
+    tenants: list[dict[str, Any]],
+    users: list[dict[str, Any]],
+    memberships: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    status: str | None = None,
+    error: str | None = None,
+) -> str:
+    tenant_rows = "\n".join(
+        f"<tr><td>{_e(item.get('tenant_id'))}</td><td>{_e(item.get('tenant_key'))}</td><td>{_e(item.get('name'))}</td><td>{_state(item.get('disabled'))}</td></tr>"
+        for item in tenants
+    )
+    user_rows = "\n".join(
+        f"<tr><td>{_e(item.get('user_id'))}</td><td>{_e(item.get('user_key'))}</td><td>{_e(item.get('display_name'))}</td><td>{_e(item.get('email'))}</td><td>{_state(item.get('disabled'))}</td></tr>"
+        for item in users
+    )
+    membership_rows = "\n".join(
+        "<tr>"
+        f"<td>{_e(item.get('tenant_id'))}</td>"
+        f"<td>{_e(item.get('user_id'))}</td>"
+        f"<td>{_e(_join_values(item.get('roles')))}</td>"
+        f"<td>{_e(_join_values(item.get('groups')))}</td>"
+        f"<td>{_membership_state(item)}</td>"
+        "</tr>"
+        for item in memberships
+    )
+    event_rows = "\n".join(
+        "<tr>"
+        f"<td>{_e(item.get('event_type'))}</td>"
+        f"<td>{_e(item.get('actor'))}</td>"
+        f"<td>{_e(item.get('tenant_id'))}</td>"
+        f"<td>{_e(item.get('target'))}</td>"
+        f"<td>{_e(item.get('created_at'))}</td>"
+        "</tr>"
+        for item in events
+    )
+    notice = f'<p class="notice">{_e(status)}</p>' if status else ""
+    alert = f'<p class="error">{_e(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AuthNode Admin</title>
+  <style>{_admin_css()}</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>AuthNode Admin</h1>
+      <p>Local IAM catalog</p>
+    </div>
+    <form method="post" action="/admin/logout"><button type="submit">Sign out</button></form>
+  </header>
+  <main>
+    {notice}
+    {alert}
+    <section>
+      <h2>Tenants</h2>
+      <div class="grid two">
+        <form method="post" action="/admin/action">
+          <input type="hidden" name="action" value="tenant.create">
+          <label>Tenant id<input name="tenant_id" required></label>
+          <label>Tenant key<input name="tenant_key"></label>
+          <label>Name<input name="name"></label>
+          <button type="submit">Save tenant</button>
+        </form>
+        <form method="post" action="/admin/action">
+          <label>Tenant id<input name="tenant_id" required></label>
+          <div class="actions">
+            <button name="action" value="tenant.enable" type="submit">Enable</button>
+            <button name="action" value="tenant.disable" type="submit">Disable</button>
+          </div>
+        </form>
+      </div>
+      <table><thead><tr><th>Tenant id</th><th>Tenant key</th><th>Name</th><th>State</th></tr></thead><tbody>{tenant_rows}</tbody></table>
+    </section>
+    <section>
+      <h2>Users</h2>
+      <div class="grid three">
+        <form method="post" action="/admin/action">
+          <input type="hidden" name="action" value="user.create">
+          <label>User id<input name="user_id" required></label>
+          <label>Display name<input name="display_name"></label>
+          <label>Email<input name="email" type="email"></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password"></label>
+          <button type="submit">Save user</button>
+        </form>
+        <form method="post" action="/admin/action">
+          <input type="hidden" name="action" value="user.password">
+          <label>User id<input name="user_id" required></label>
+          <label>New password<input name="password" type="password" autocomplete="new-password" required></label>
+          <button type="submit">Reset password</button>
+        </form>
+        <form method="post" action="/admin/action">
+          <label>User id<input name="user_id" required></label>
+          <div class="actions">
+            <button name="action" value="user.enable" type="submit">Enable</button>
+            <button name="action" value="user.disable" type="submit">Disable</button>
+          </div>
+        </form>
+      </div>
+      <table><thead><tr><th>User id</th><th>User key</th><th>Name</th><th>Email</th><th>State</th></tr></thead><tbody>{user_rows}</tbody></table>
+    </section>
+    <section>
+      <h2>Memberships</h2>
+      <div class="grid two">
+        <form method="post" action="/admin/action">
+          <input type="hidden" name="action" value="membership.save">
+          <label>User id<input name="user_id" required></label>
+          <label>Tenant id<input name="tenant_id" required></label>
+          <label>Roles<input name="roles" placeholder="admin,writer"></label>
+          <label>Groups<input name="groups" placeholder="local,research"></label>
+          <button type="submit">Save membership</button>
+        </form>
+        <form method="post" action="/admin/action">
+          <input type="hidden" name="action" value="membership.remove">
+          <label>User id<input name="user_id" required></label>
+          <label>Tenant id<input name="tenant_id" required></label>
+          <button type="submit">Remove membership</button>
+        </form>
+      </div>
+      <table><thead><tr><th>Tenant</th><th>User</th><th>Roles</th><th>Groups</th><th>State</th></tr></thead><tbody>{membership_rows}</tbody></table>
+    </section>
+    <section>
+      <h2>Audit</h2>
+      <table><thead><tr><th>Event</th><th>Actor</th><th>Tenant</th><th>Target</th><th>Time</th></tr></thead><tbody>{event_rows}</tbody></table>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def _admin_css() -> str:
+    return """
+:root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; background: #f6f7f8; color: #171717; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 20px 28px; border-bottom: 1px solid #d9dde2; background: #fff; }
+h1, h2, p { margin: 0; }
+h1 { font-size: 24px; }
+h2 { font-size: 18px; margin-bottom: 14px; }
+main { display: grid; gap: 20px; padding: 24px; max-width: 1180px; margin: 0 auto; }
+section, .login-shell { background: #fff; border: 1px solid #d9dde2; border-radius: 8px; padding: 18px; }
+.login-shell { width: min(420px, calc(100vw - 32px)); margin: 15vh auto 0; display: grid; gap: 16px; }
+.grid { display: grid; gap: 14px; margin-bottom: 18px; }
+.grid.two { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.grid.three { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+form { display: grid; gap: 10px; align-content: start; }
+label { display: grid; gap: 6px; font-size: 13px; color: #41474d; }
+input { min-height: 38px; border: 1px solid #c6ccd2; border-radius: 6px; padding: 0 10px; font: inherit; }
+button { min-height: 38px; border: 0; border-radius: 6px; padding: 0 14px; background: #1d4f47; color: #fff; font-weight: 700; cursor: pointer; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { border-top: 1px solid #e4e7eb; padding: 9px 8px; text-align: left; vertical-align: top; }
+th { color: #5a626b; font-weight: 700; }
+.notice, .error { padding: 10px 12px; border-radius: 6px; }
+.notice { background: #e8f4ef; color: #163b34; }
+.error { background: #fff0f0; color: #8a1f1f; }
+""".strip()
+
+
+def _e(value: Any) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _state(value: Any) -> str:
+    return "disabled" if int(value or 0) else "active"
+
+
+def _membership_state(item: Mapping[str, Any]) -> str:
+    states = []
+    if int(item.get("membership_disabled") or 0):
+        states.append("membership disabled")
+    if int(item.get("user_disabled") or 0):
+        states.append("user disabled")
+    if int(item.get("tenant_disabled") or 0):
+        states.append("tenant disabled")
+    return _e(", ".join(states) if states else "active")
+
+
+def _join_values(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value)
+    return str(value or "")
+
+
 def _trusted_headers_for_identity(user: User, tenant: Tenant, *, target: str) -> dict[str, str]:
     selected = target.strip().lower()
     headers: dict[str, str] = {}
@@ -1052,6 +1502,14 @@ def _pkce_verifier() -> str:
 
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _body_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return _truthy(str(value))
 
 
 def _list_value(value: Any) -> list[str]:

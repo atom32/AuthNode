@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     tenant_subparsers.add_parser("list", help="List tenants").add_argument("--include-disabled", action="store_true")
     tenant_disable = tenant_subparsers.add_parser("disable", help="Disable a tenant")
     tenant_disable.add_argument("tenant_id")
+    tenant_enable = tenant_subparsers.add_parser("enable", help="Enable a disabled tenant")
+    tenant_enable.add_argument("tenant_id")
 
     user_parser = subparsers.add_parser("user", help="Manage Local IAM users")
     user_subparsers = user_parser.add_subparsers(dest="user_command", required=True)
@@ -69,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     user_subparsers.add_parser("list", help="List users").add_argument("--include-disabled", action="store_true")
     user_disable = user_subparsers.add_parser("disable", help="Disable a user")
     user_disable.add_argument("user_id")
+    user_enable = user_subparsers.add_parser("enable", help="Enable a disabled user")
+    user_enable.add_argument("user_id")
     user_reset = user_subparsers.add_parser("reset-password", help="Reset a user password")
     user_reset.add_argument("user_id")
     user_reset.add_argument("--password", required=True)
@@ -83,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     membership_remove = membership_subparsers.add_parser("remove", help="Disable a membership")
     membership_remove.add_argument("user_id")
     membership_remove.add_argument("tenant_id")
+    membership_subparsers.add_parser("list", help="List tenant memberships").add_argument("--include-disabled", action="store_true")
 
     role_parser = subparsers.add_parser("role", help="Manage Local IAM role grants")
     role_subparsers = role_parser.add_subparsers(dest="role_command", required=True)
@@ -94,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
     role_revoke.add_argument("user_id")
     role_revoke.add_argument("tenant_id")
     role_revoke.add_argument("role")
+
+    group_parser = subparsers.add_parser("group", help="Manage Local IAM group grants")
+    group_subparsers = group_parser.add_subparsers(dest="group_command", required=True)
+    group_grant = group_subparsers.add_parser("grant", help="Grant a group")
+    group_grant.add_argument("user_id")
+    group_grant.add_argument("tenant_id")
+    group_grant.add_argument("group")
+    group_revoke = group_subparsers.add_parser("revoke", help="Revoke a group")
+    group_revoke.add_argument("user_id")
+    group_revoke.add_argument("tenant_id")
+    group_revoke.add_argument("group")
 
     audit_parser = subparsers.add_parser("audit", help="Read Local IAM audit events")
     audit_subparsers = audit_parser.add_subparsers(dest="audit_command", required=True)
@@ -189,6 +205,10 @@ def main(argv: list[str] | None = None) -> int:
             catalog.disable_tenant(args.tenant_id)
             print_json({"ok": True})
             return 0
+        if args.tenant_command == "enable":
+            catalog.enable_tenant(args.tenant_id)
+            print_json({"ok": True})
+            return 0
     if args.command == "user":
         catalog = AuthCatalog(config)
         catalog.init()
@@ -201,6 +221,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.user_command == "disable":
             catalog.disable_user(args.user_id)
+            print_json({"ok": True})
+            return 0
+        if args.user_command == "enable":
+            catalog.enable_user(args.user_id)
             print_json({"ok": True})
             return 0
         if args.user_command == "reset-password":
@@ -223,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:
             catalog.remove_membership(args.user_id, args.tenant_id)
             print_json({"ok": True})
             return 0
+        if args.membership_command == "list":
+            print_json({"memberships": catalog.list_memberships(include_disabled=args.include_disabled)})
+            return 0
     if args.command == "role":
         catalog = AuthCatalog(config)
         catalog.init()
@@ -232,6 +259,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.role_command == "revoke":
             catalog.revoke_role(args.user_id, args.tenant_id, args.role)
+            print_json({"ok": True})
+            return 0
+    if args.command == "group":
+        catalog = AuthCatalog(config)
+        catalog.init()
+        if args.group_command == "grant":
+            catalog.grant_group(args.user_id, args.tenant_id, args.group)
+            print_json({"ok": True})
+            return 0
+        if args.group_command == "revoke":
+            catalog.revoke_group(args.user_id, args.tenant_id, args.group)
             print_json({"ok": True})
             return 0
     if args.command == "audit":

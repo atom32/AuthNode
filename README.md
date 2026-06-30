@@ -156,11 +156,89 @@ python -m authnode --config authnode.local.json tenant create tenant_demo --name
 python -m authnode --config authnode.local.json user create demo_user --password 'change-me-now' --email demo@example.test
 python -m authnode --config authnode.local.json membership add demo_user tenant_demo --roles writer --groups local
 python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
+python -m authnode --config authnode.local.json membership list --include-disabled
+python -m authnode --config authnode.local.json user disable demo_user
+python -m authnode --config authnode.local.json user enable demo_user
 python -m authnode --config authnode.local.json audit list --limit 20
 ```
 
 The admin-token protected JSON API exposes the same Local IAM operations under
 `/v1/iam/*`.
+
+## Add A Local Tenant And User
+
+This is the normal local product-management flow for a new PSKA/FastReAct
+tenant:
+
+1. Start AuthNode:
+
+```bash
+./start.sh
+```
+
+2. Initialize the catalog if this is a fresh checkout:
+
+```bash
+python -m authnode --config authnode.local.json iam init --seed-config
+```
+
+3. Create a tenant:
+
+```bash
+python -m authnode --config authnode.local.json tenant create tenant_demo --name "Demo Tenant"
+```
+
+4. Create a user and set an initial password:
+
+```bash
+python -m authnode --config authnode.local.json user create demo_user \
+  --display-name "Demo User" \
+  --email demo@example.test \
+  --password 'change-me-now'
+```
+
+5. Add the user to the tenant and set roles/groups:
+
+```bash
+python -m authnode --config authnode.local.json membership add demo_user tenant_demo \
+  --roles writer \
+  --groups local
+```
+
+6. Reset the password when needed:
+
+```bash
+python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
+```
+
+7. Log in through the browser flow:
+
+```text
+http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
+```
+
+Use `tenant_demo`, `demo_user`, and the current password. AuthNode redirects
+back with a one-time code that the PSKA gateway exchanges server-side.
+
+8. Review audit events:
+
+```bash
+python -m authnode --config authnode.local.json audit list --limit 20
+```
+
+The same flow is available at `http://127.0.0.1:8788/admin`. The browser admin
+page accepts the local `admin_token` once, sets an HttpOnly admin session
+cookie, and then performs catalog changes server-side. The token is not placed
+in page JavaScript or form action URLs.
+
+For automation, call `/v1/iam/*` with:
+
+```http
+X-AuthNode-Admin-Token: <admin-token>
+```
+
+Use placeholders in scripts and inject the token from local secrets; do not
+commit it.
 
 ## Legacy JSON Dev Login
 
@@ -301,6 +379,10 @@ identity.
 - `GET /ready`
 - `GET /login`
 - `POST /login`
+- `GET /admin`
+- `GET/POST /admin/login`
+- `POST /admin/action`
+- `GET/POST /admin/logout`
 - `GET /oidc/callback`
 - `GET /logout`
 - `POST /v1/auth/exchange`
@@ -308,10 +390,11 @@ identity.
 - `GET /v1/users`
 - `POST /v1/token`
 - `GET /v1/headers`
-- `GET/POST/DELETE /v1/iam/tenants`
-- `GET/POST/DELETE /v1/iam/users`
-- `POST/DELETE /v1/iam/memberships`
+- `GET/POST/PATCH/DELETE /v1/iam/tenants`
+- `GET/POST/PATCH/DELETE /v1/iam/users`
+- `GET/POST/DELETE /v1/iam/memberships`
 - `POST/DELETE /v1/iam/roles`
+- `POST/DELETE /v1/iam/groups`
 - `POST /v1/iam/provider-accounts`
 - `GET /v1/iam/audit`
 - `ANY /proxy/{target}/{path}`

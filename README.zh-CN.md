@@ -149,10 +149,82 @@ python -m authnode --config authnode.local.json tenant create tenant_demo --name
 python -m authnode --config authnode.local.json user create demo_user --password 'change-me-now' --email demo@example.test
 python -m authnode --config authnode.local.json membership add demo_user tenant_demo --roles writer --groups local
 python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
+python -m authnode --config authnode.local.json membership list --include-disabled
+python -m authnode --config authnode.local.json user disable demo_user
+python -m authnode --config authnode.local.json user enable demo_user
 python -m authnode --config authnode.local.json audit list --limit 20
 ```
 
 同样的管理能力也通过 `/v1/iam/*` JSON API 暴露。配置了 `admin_token` 时，需要 `X-AuthNode-Admin-Token` 或 `Authorization: Bearer <admin-token>`。
+
+## 本地新增租户和用户
+
+这是给 PSKA/FastReAct 本地联调新增一个租户和用户的标准流程：
+
+1. 启动 AuthNode：
+
+```bash
+./start.sh
+```
+
+2. 如果是全新 checkout，先初始化 catalog：
+
+```bash
+python -m authnode --config authnode.local.json iam init --seed-config
+```
+
+3. 创建 tenant：
+
+```bash
+python -m authnode --config authnode.local.json tenant create tenant_demo --name "Demo Tenant"
+```
+
+4. 创建用户并设置初始密码：
+
+```bash
+python -m authnode --config authnode.local.json user create demo_user \
+  --display-name "Demo User" \
+  --email demo@example.test \
+  --password 'change-me-now'
+```
+
+5. 把用户加入 tenant，并设置 roles/groups：
+
+```bash
+python -m authnode --config authnode.local.json membership add demo_user tenant_demo \
+  --roles writer \
+  --groups local
+```
+
+6. 需要时重置密码：
+
+```bash
+python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
+```
+
+7. 通过浏览器登录到 PSKA：
+
+```text
+http://127.0.0.1:8788/login?target=pska&return_to=http://127.0.0.1:5173/auth/callback&next=/
+```
+
+登录时使用 `tenant_demo`、`demo_user` 和当前密码。AuthNode 会把浏览器重定向回 PSKA gateway，并携带一个服务端交换用的一次性 code。
+
+8. 查看审计：
+
+```bash
+python -m authnode --config authnode.local.json audit list --limit 20
+```
+
+同样的流程也可以在 `http://127.0.0.1:8788/admin` 完成。本地 admin 页面只在登录时接收一次 `admin_token`，随后设置 HttpOnly admin session cookie，后续表单提交都由服务端直接操作 catalog。页面和 JavaScript 不会持有 admin token。
+
+自动化脚本可以调用 `/v1/iam/*`，请求头使用：
+
+```http
+X-AuthNode-Admin-Token: <admin-token>
+```
+
+脚本里请从本地 secret 注入 token，不要把真实 token 写进仓库、日志或提交信息。
 
 ## 旧版 JSON 开发登录
 
@@ -283,6 +355,10 @@ curl "http://127.0.0.1:8788/proxy/fastreact/ready?authnode_user_key=pska:user_pr
 - `GET /ready`
 - `GET /login`
 - `POST /login`
+- `GET /admin`
+- `GET/POST /admin/login`
+- `POST /admin/action`
+- `GET/POST /admin/logout`
 - `GET /oidc/callback`
 - `GET /logout`
 - `POST /v1/auth/exchange`
@@ -290,10 +366,11 @@ curl "http://127.0.0.1:8788/proxy/fastreact/ready?authnode_user_key=pska:user_pr
 - `GET /v1/users`
 - `POST /v1/token`
 - `GET /v1/headers`
-- `GET/POST/DELETE /v1/iam/tenants`
-- `GET/POST/DELETE /v1/iam/users`
-- `POST/DELETE /v1/iam/memberships`
+- `GET/POST/PATCH/DELETE /v1/iam/tenants`
+- `GET/POST/PATCH/DELETE /v1/iam/users`
+- `GET/POST/DELETE /v1/iam/memberships`
 - `POST/DELETE /v1/iam/roles`
+- `POST/DELETE /v1/iam/groups`
 - `POST /v1/iam/provider-accounts`
 - `GET /v1/iam/audit`
 - `ANY /proxy/{target}/{path}`

@@ -112,6 +112,7 @@ print_urls() {
   local url
   url="$(authnode_url)"
   echo "AuthNode ready:       $url/ready"
+  echo "Admin console:        $url/admin"
   echo "FastReAct proxy:      $url/proxy/fastreact"
   echo "PSKA proxy:           $url/proxy/pska"
   echo "Config:               $CONFIG_FILE"

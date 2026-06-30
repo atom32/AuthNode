@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,7 +18,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 
 from authnode.catalog import AuthCatalog, SESSION_COOKIE_NAME
-from authnode.config import AuthNodeConfig
+from authnode.cli import main as cli_main
+from authnode.config import AuthNodeConfig, load_config
 from authnode.contract import check_contract
 from authnode.identity import issue_identity_token, trusted_headers_for_user
 from authnode.jwt import decode_hs256
@@ -526,6 +529,95 @@ class AuthNodeTests(unittest.TestCase):
             self.assertIn("login.rate_limited", {event["event_type"] for event in events})
             self.assertIn("login.failure", {event["event_type"] for event in events})
 
+    def test_local_iam_strict_membership_disabled_user_reset_password_and_audit(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir)
+            catalog = AuthCatalog(config)
+            catalog.seed_from_config()
+
+            catalog.create_tenant("tenant_b", name="Tenant B")
+            catalog.create_user("bob", password="bob-local12")
+
+            with self.assertRaisesRegex(Exception, "invalid username or password|unknown catalog identity"):
+                catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-local12")
+
+            catalog.add_membership("bob", "tenant_b", roles=["writer"], groups=["qa"])
+            user, tenant = catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-local12")
+            self.assertEqual(user.user_key, "pska:bob")
+            self.assertEqual(tenant.tenant_id, "tenant_b")
+            self.assertEqual(user.roles, ("writer",))
+            self.assertEqual(user.groups, ("qa",))
+
+            catalog.set_password("bob", "bob-new-pass")
+            with self.assertRaisesRegex(Exception, "invalid username or password"):
+                catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-local12")
+            catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-new-pass")
+
+            catalog.disable_user("bob")
+            with self.assertRaisesRegex(Exception, "invalid username or password"):
+                catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-new-pass")
+            catalog.enable_user("bob")
+            catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-new-pass")
+
+            catalog.remove_membership("bob", "tenant_b")
+            with self.assertRaisesRegex(Exception, "invalid username or password|unknown catalog identity"):
+                catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-new-pass")
+
+            events = {event["event_type"] for event in catalog.list_audit(limit=50)}
+            self.assertIn("user.password_set", events)
+            self.assertIn("user.disable", events)
+            self.assertIn("user.enable", events)
+            self.assertIn("membership.disable", events)
+
+    def test_cli_local_admin_flow_creates_login_ready_user(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "authnode.local.json"
+            data = {
+                **CONFIG_DATA,
+                "browser_login_provider": "local_iam",
+                "identity_mode": "hybrid",
+                "catalog_store": {"type": "sqlite", "path": "authnode-cli.db"},
+                "password_policy": {"min_length": 10},
+                "tenants": [],
+                "users": [],
+            }
+            config_path.write_text(json.dumps(data), encoding="utf-8")
+
+            _run_cli("--config", str(config_path), "iam", "init")
+            _run_cli("--config", str(config_path), "tenant", "create", "tenant_cli", "--name", "CLI Tenant")
+            _run_cli(
+                "--config",
+                str(config_path),
+                "user",
+                "create",
+                "cli_user",
+                "--display-name",
+                "CLI User",
+                "--password",
+                "cli-password",
+            )
+            _run_cli(
+                "--config",
+                str(config_path),
+                "membership",
+                "add",
+                "cli_user",
+                "tenant_cli",
+                "--roles",
+                "admin,writer",
+                "--groups",
+                "local",
+            )
+            _run_cli("--config", str(config_path), "user", "reset-password", "cli_user", "--password", "cli-new-pass")
+
+            catalog = AuthCatalog(load_config(config_path))
+            user, tenant = catalog.authenticate(username="cli_user", tenant_id="tenant_cli", password="cli-new-pass")
+            self.assertEqual(user.user_key, "pska:cli_user")
+            self.assertEqual(tenant.tenant_id, "tenant_cli")
+            self.assertIn("admin", user.roles)
+            memberships = catalog.list_memberships()
+            self.assertEqual(memberships[0]["groups"], ["local"])
+
     def test_local_iam_browser_login_sets_authnode_session_and_reuses_it(self) -> None:
         with TemporaryDirectory() as tmpdir:
             config = local_iam_config(tmpdir)
@@ -641,6 +733,16 @@ class AuthNodeTests(unittest.TestCase):
                     {"user_id": "bob", "tenant_id": "tenant_b", "role": "reviewer"},
                     headers=headers,
                 )
+                _json_request(
+                    f"{base_url}/v1/iam/groups",
+                    {"user_id": "bob", "tenant_id": "tenant_b", "group": "review"},
+                    headers=headers,
+                )
+                _json_request(
+                    f"{base_url}/v1/iam/users/bob/password",
+                    {"password": "bob-new-pass"},
+                    headers=headers,
+                )
 
                 with urlopen(Request(f"{base_url}/v1/iam/users", headers=headers), timeout=5) as response:
                     users = json.loads(response.read().decode("utf-8"))["users"]
@@ -652,10 +754,138 @@ class AuthNodeTests(unittest.TestCase):
                 self.assertIn("writer", catalog_user.roles)
                 self.assertIn("reviewer", catalog_user.roles)
                 self.assertIn("qa", catalog_user.groups)
+                self.assertIn("review", catalog_user.groups)
+                server.catalog.authenticate(username="bob", tenant_id="tenant_b", password="bob-new-pass")
+
+                _json_request(
+                    f"{base_url}/v1/iam/memberships",
+                    {"user_id": "bob", "tenant_id": "tenant_b"},
+                    headers=headers,
+                    method="DELETE",
+                )
+                with self.assertRaisesRegex(Exception, "unknown catalog identity"):
+                    server.catalog.resolve_identity(user_key_or_id="bob", tenant_id="tenant_b")
+                _json_request(
+                    f"{base_url}/v1/iam/memberships",
+                    {"user_id": "bob", "tenant_id": "tenant_b", "roles": ["writer"], "groups": ["qa"]},
+                    headers=headers,
+                )
+
+                _json_request(f"{base_url}/v1/iam/users/bob/disable", {}, headers=headers)
+                with self.assertRaisesRegex(Exception, "unknown catalog identity"):
+                    server.catalog.resolve_identity(user_key_or_id="bob", tenant_id="tenant_b")
+                _json_request(f"{base_url}/v1/iam/users/bob/enable", {}, headers=headers)
+                server.catalog.resolve_identity(user_key_or_id="bob", tenant_id="tenant_b")
+
+                with urlopen(Request(f"{base_url}/v1/iam/memberships?include_disabled=1", headers=headers), timeout=5) as response:
+                    memberships = json.loads(response.read().decode("utf-8"))["memberships"]
+                self.assertIn("bob", {item["user_id"] for item in memberships})
 
                 with urlopen(Request(f"{base_url}/v1/iam/audit?limit=20", headers=headers), timeout=5) as response:
                     events = json.loads(response.read().decode("utf-8"))["events"]
-                self.assertIn("membership.upsert", {event["event_type"] for event in events})
+                event_types = {event["event_type"] for event in events}
+                self.assertIn("membership.upsert", event_types)
+                self.assertIn("user.password_set", event_types)
+                self.assertIn("user.disable", event_types)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_local_admin_ui_uses_http_only_session_and_creates_login_identity(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir, {"admin_token": "admin-secret", "strict_identity": True})
+            server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            opener = build_opener(NoRedirectHandler)
+            try:
+                blocked = _open_no_redirect(opener, f"{base_url}/admin")
+                self.assertEqual(blocked.code, 302)
+                self.assertEqual(blocked.headers["Location"], "/admin/login")
+
+                with urlopen(f"{base_url}/admin/login", timeout=5) as response:
+                    login_page = response.read().decode("utf-8")
+                self.assertIn("AuthNode Admin", login_page)
+                self.assertNotIn("admin-secret", login_page)
+
+                login_body = urlencode({"admin_token": "admin-secret"}).encode()
+                login_request = Request(
+                    f"{base_url}/admin/login",
+                    data=login_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                login = _open_no_redirect(opener, login_request)
+                self.assertEqual(login.code, 302)
+                admin_cookie = login.headers["Set-Cookie"]
+                self.assertIn("authnode_admin=", admin_cookie)
+                self.assertIn("HttpOnly", admin_cookie)
+                self.assertNotIn("admin-secret", admin_cookie)
+                cookie_header = admin_cookie.split(";", 1)[0]
+
+                with urlopen(Request(f"{base_url}/admin", headers={"Cookie": cookie_header}), timeout=5) as response:
+                    admin_page = response.read().decode("utf-8")
+                self.assertIn("Local IAM catalog", admin_page)
+                self.assertNotIn("admin-secret", admin_page)
+
+                _post_form_no_redirect(
+                    opener,
+                    f"{base_url}/admin/action",
+                    {
+                        "action": "tenant.create",
+                        "tenant_id": "tenant_ui",
+                        "name": "UI Tenant",
+                    },
+                    cookie_header,
+                )
+                _post_form_no_redirect(
+                    opener,
+                    f"{base_url}/admin/action",
+                    {
+                        "action": "user.create",
+                        "user_id": "ui_user",
+                        "display_name": "UI User",
+                        "password": "ui-password1",
+                    },
+                    cookie_header,
+                )
+                _post_form_no_redirect(
+                    opener,
+                    f"{base_url}/admin/action",
+                    {
+                        "action": "membership.save",
+                        "user_id": "ui_user",
+                        "tenant_id": "tenant_ui",
+                        "roles": "writer",
+                        "groups": "local",
+                    },
+                    cookie_header,
+                )
+
+                user, tenant = server.catalog.authenticate(username="ui_user", tenant_id="tenant_ui", password="ui-password1")
+                self.assertEqual(user.user_key, "pska:ui_user")
+                self.assertEqual(tenant.tenant_id, "tenant_ui")
+
+                login_body = urlencode(
+                    {
+                        "username": "ui_user",
+                        "tenant_id": "tenant_ui",
+                        "password": "ui-password1",
+                        "target": "pska",
+                        "return_to": "http://pska.local/auth/callback",
+                    }
+                ).encode()
+                request = Request(
+                    f"{base_url}/login",
+                    data=login_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                response = _open_no_redirect(opener, request)
+                self.assertEqual(response.code, 302)
+                self.assertIn("code=", response.headers["Location"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -704,15 +934,38 @@ def _open_no_redirect(opener, request):  # noqa: ANN001 - urllib opener/response
         raise
 
 
-def _json_request(url: str, payload: dict, *, headers: dict[str, str]) -> dict:
+def _post_form_no_redirect(opener, url: str, payload: dict[str, str], cookie: str):  # noqa: ANN001 - urllib opener test helper.
+    request = Request(
+        url,
+        data=urlencode(payload).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+        method="POST",
+    )
+    response = _open_no_redirect(opener, request)
+    if response.code not in {302, 303}:
+        raise AssertionError(f"unexpected response: {response.code}")
+    return response
+
+
+def _json_request(url: str, payload: dict, *, headers: dict[str, str], method: str = "POST") -> dict:
     request = Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", **headers},
-        method="POST",
+        method=method,
     )
     with urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _run_cli(*argv: str) -> dict:
+    output = io.StringIO()
+    with redirect_stdout(output):
+        code = cli_main(list(argv))
+    if code != 0:
+        raise AssertionError(f"CLI exited with {code}: {argv}")
+    text = output.getvalue()
+    return json.loads(text) if text.strip() else {}
 
 
 class FakeResponse:
