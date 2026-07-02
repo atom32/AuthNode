@@ -38,7 +38,7 @@
   },
   "targets": {
     "fastreact": {
-      "base_url": "http://127.0.0.1:8000",
+      "base_url": "http://127.0.0.1:18741",
       "mode": "jwt"
     },
     "pska": {

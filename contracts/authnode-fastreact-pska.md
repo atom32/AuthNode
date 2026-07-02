@@ -147,7 +147,7 @@ call:
 python -m authnode contract pska:user_primary \
   --tenant tenant_default \
   --live \
-  --fastreact-url http://127.0.0.1:8000 \
+  --fastreact-url http://127.0.0.1:18741 \
   --fastreact-chat
 ```
 

@@ -87,9 +87,10 @@ Start AuthNode in the foreground:
 ./start.sh
 ```
 
-On first run, the script creates `authnode.local.json` from
+On first run, the script creates `.authnode/config.json` from
 `authnode.example.json` and initializes local-only `jwt_secret` and
-`admin_token` values. Do not commit `authnode.local.json`.
+`admin_token` values. Do not commit `.authnode/config.json`. Existing
+`authnode.local.json` files are still honored for compatibility.
 
 Open the browser login flow directly:
 
@@ -108,7 +109,7 @@ Run as a background local service:
 Useful environment overrides:
 
 ```bash
-export AUTHNODE_CONFIG=/path/to/authnode.local.json
+export AUTHNODE_CONFIG=/path/to/.authnode/config.json
 export AUTHNODE_HOST=127.0.0.1
 export AUTHNODE_PORT=8788
 export AUTHNODE_PYTHON=/path/to/python
@@ -135,7 +136,7 @@ The default example config uses:
 Initialize and seed the SQLite catalog:
 
 ```bash
-python -m authnode --config authnode.local.json iam init --seed-config
+python -m authnode --config .authnode/config.json iam init --seed-config
 ```
 
 Local IAM includes:
@@ -150,16 +151,16 @@ Local IAM includes:
 Common commands:
 
 ```bash
-python -m authnode --config authnode.local.json tenant list
-python -m authnode --config authnode.local.json user list
-python -m authnode --config authnode.local.json tenant create tenant_demo --name "Demo Tenant"
-python -m authnode --config authnode.local.json user create demo_user --password 'change-me-now' --email demo@example.test
-python -m authnode --config authnode.local.json membership add demo_user tenant_demo --roles writer --groups local
-python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
-python -m authnode --config authnode.local.json membership list --include-disabled
-python -m authnode --config authnode.local.json user disable demo_user
-python -m authnode --config authnode.local.json user enable demo_user
-python -m authnode --config authnode.local.json audit list --limit 20
+python -m authnode --config .authnode/config.json tenant list
+python -m authnode --config .authnode/config.json user list
+python -m authnode --config .authnode/config.json tenant create tenant_demo --name "Demo Tenant"
+python -m authnode --config .authnode/config.json user create demo_user --password 'change-me-now' --email demo@example.test
+python -m authnode --config .authnode/config.json membership add demo_user tenant_demo --roles writer --groups local
+python -m authnode --config .authnode/config.json user reset-password demo_user --password 'new-password'
+python -m authnode --config .authnode/config.json membership list --include-disabled
+python -m authnode --config .authnode/config.json user disable demo_user
+python -m authnode --config .authnode/config.json user enable demo_user
+python -m authnode --config .authnode/config.json audit list --limit 20
 ```
 
 The admin-token protected JSON API exposes the same Local IAM operations under
@@ -179,19 +180,19 @@ tenant:
 2. Initialize the catalog if this is a fresh checkout:
 
 ```bash
-python -m authnode --config authnode.local.json iam init --seed-config
+python -m authnode --config .authnode/config.json iam init --seed-config
 ```
 
 3. Create a tenant:
 
 ```bash
-python -m authnode --config authnode.local.json tenant create tenant_demo --name "Demo Tenant"
+python -m authnode --config .authnode/config.json tenant create tenant_demo --name "Demo Tenant"
 ```
 
 4. Create a user and set an initial password:
 
 ```bash
-python -m authnode --config authnode.local.json user create demo_user \
+python -m authnode --config .authnode/config.json user create demo_user \
   --display-name "Demo User" \
   --email demo@example.test \
   --password 'change-me-now'
@@ -200,7 +201,7 @@ python -m authnode --config authnode.local.json user create demo_user \
 5. Add the user to the tenant and set roles/groups:
 
 ```bash
-python -m authnode --config authnode.local.json membership add demo_user tenant_demo \
+python -m authnode --config .authnode/config.json membership add demo_user tenant_demo \
   --roles writer \
   --groups local
 ```
@@ -208,7 +209,7 @@ python -m authnode --config authnode.local.json membership add demo_user tenant_
 6. Reset the password when needed:
 
 ```bash
-python -m authnode --config authnode.local.json user reset-password demo_user --password 'new-password'
+python -m authnode --config .authnode/config.json user reset-password demo_user --password 'new-password'
 ```
 
 7. Log in through the browser flow:
@@ -223,7 +224,7 @@ back with a one-time code that the PSKA gateway exchanges server-side.
 8. Review audit events:
 
 ```bash
-python -m authnode --config authnode.local.json audit list --limit 20
+python -m authnode --config .authnode/config.json audit list --limit 20
 ```
 
 The same flow is available at `http://127.0.0.1:8788/admin`. The browser admin
@@ -302,22 +303,22 @@ from `/v1/token` so browsers and gateways do not need the AuthNode admin token.
 Issue a JWT:
 
 ```bash
-python -m authnode --config authnode.local.json token pska:user_primary --tenant tenant_default
-python -m authnode --config authnode.local.json token pska:user_primary --audience pska --raw
+python -m authnode --config .authnode/config.json token pska:user_primary --tenant tenant_default
+python -m authnode --config .authnode/config.json token pska:user_primary --audience pska --raw
 ```
 
 Print trusted headers:
 
 ```bash
-python -m authnode --config authnode.local.json headers pska:user_primary --target both
-python -m authnode --config authnode.local.json headers pska:user_primary --target pska --curl
+python -m authnode --config .authnode/config.json headers pska:user_primary --target both
+python -m authnode --config .authnode/config.json headers pska:user_primary --target pska --curl
 ```
 
 Generate downstream environment variables:
 
 ```bash
-python -m authnode --config authnode.local.json env
-python -m authnode --config authnode.local.json env --mode trusted_headers
+python -m authnode --config .authnode/config.json env
+python -m authnode --config .authnode/config.json env --mode trusted_headers
 ```
 
 If `admin_token` is configured, `/v1/token`, `/v1/headers`, and `/v1/iam/*`
@@ -421,13 +422,13 @@ Example `/v1/headers` query:
 Run offline checks:
 
 ```bash
-python -m authnode --config authnode.local.json contract pska:user_primary --tenant tenant_default
+python -m authnode --config .authnode/config.json contract pska:user_primary --tenant tenant_default
 ```
 
 Run a live PSKA `/ready` check:
 
 ```bash
-python -m authnode --config authnode.local.json contract pska:user_primary \
+python -m authnode --config .authnode/config.json contract pska:user_primary \
   --tenant tenant_default \
   --live \
   --pska-url http://127.0.0.1:8765
@@ -436,10 +437,10 @@ python -m authnode --config authnode.local.json contract pska:user_primary \
 Call FastReAct only when you explicitly want a live agent request:
 
 ```bash
-python -m authnode --config authnode.local.json contract pska:user_primary \
+python -m authnode --config .authnode/config.json contract pska:user_primary \
   --tenant tenant_default \
   --live \
-  --fastreact-url http://127.0.0.1:8000 \
+  --fastreact-url http://127.0.0.1:18741 \
   --fastreact-chat
 ```
 
@@ -485,7 +486,7 @@ Useful source files:
 
 Runtime files are intentionally local:
 
-- `authnode.local.json`: local secrets and config, ignored by Git
+- `.authnode/config.json`: local secrets and config, ignored by Git
 - `data/authnode.db`: Local IAM SQLite database, ignored by Git
 - `logs/`: daemon logs, ignored by Git
 - `run/`: daemon PID files, ignored by Git

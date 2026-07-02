@@ -2,7 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${AUTHNODE_CONFIG:-"$ROOT_DIR/authnode.local.json"}"
+DEFAULT_CONFIG_FILE="$ROOT_DIR/.authnode/config.json"
+LEGACY_CONFIG_FILE="$ROOT_DIR/authnode.local.json"
+if [[ -n "${AUTHNODE_CONFIG:-}" ]]; then
+  CONFIG_FILE="$AUTHNODE_CONFIG"
+elif [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+  CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+elif [[ -f "$LEGACY_CONFIG_FILE" ]]; then
+  CONFIG_FILE="$LEGACY_CONFIG_FILE"
+else
+  CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+fi
 PYTHON_BIN="${AUTHNODE_PYTHON:-}"
 HOST_OVERRIDE="${AUTHNODE_HOST:-}"
 PORT_OVERRIDE="${AUTHNODE_PORT:-}"
@@ -20,12 +30,13 @@ Usage:
   ./start.sh --stop      Stop background AuthNode process started with --daemon
 
 Environment:
-  AUTHNODE_CONFIG        Config path, defaults to ./authnode.local.json
+  AUTHNODE_CONFIG        Config path, defaults to ./.authnode/config.json
   AUTHNODE_HOST          Optional serve host override
   AUTHNODE_PORT          Optional serve port override
   AUTHNODE_PYTHON        Optional Python executable override
 
-First run creates ./authnode.local.json and local-only secrets automatically.
+First run creates ./.authnode/config.json and local-only secrets automatically.
+Existing ./authnode.local.json files are still honored for compatibility.
 FastReAct and PSKA are started separately from their own repositories or
 containers.
 USAGE
@@ -53,7 +64,8 @@ ensure_config() {
     ensure_local_secrets
     return
   fi
-  if [[ "$CONFIG_FILE" == "$ROOT_DIR/authnode.local.json" ]]; then
+  if [[ "$CONFIG_FILE" == "$DEFAULT_CONFIG_FILE" || "$CONFIG_FILE" == "$LEGACY_CONFIG_FILE" ]]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
     cp "$ROOT_DIR/authnode.example.json" "$CONFIG_FILE"
     echo "Created $CONFIG_FILE from authnode.example.json."
     ensure_local_secrets
@@ -64,7 +76,7 @@ ensure_config() {
 }
 
 ensure_local_secrets() {
-  if [[ "$CONFIG_FILE" != "$ROOT_DIR/authnode.local.json" ]]; then
+  if [[ "$CONFIG_FILE" != "$DEFAULT_CONFIG_FILE" && "$CONFIG_FILE" != "$LEGACY_CONFIG_FILE" ]]; then
     return
   fi
   local python
@@ -86,7 +98,7 @@ if not data.get("admin_token") or data.get("admin_token") in {"local-admin-token
     changed = True
 if changed:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print("Initialized local jwt_secret/admin_token in authnode.local.json.")
+    print(f"Initialized local jwt_secret/admin_token in {path}.")
 PY
 }
 

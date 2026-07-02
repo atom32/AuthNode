@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG_FILE = "authnode.local.json"
+DEFAULT_CONFIG_FILE = ".authnode/config.json"
+LEGACY_CONFIG_FILE = "authnode.local.json"
 EXAMPLE_CONFIG_FILE = "authnode.example.json"
 
 
@@ -204,6 +205,9 @@ def resolve_config_path(path: str | os.PathLike[str] | None = None) -> Path:
     local = cwd / DEFAULT_CONFIG_FILE
     if local.exists():
         return local.resolve()
+    legacy = cwd / LEGACY_CONFIG_FILE
+    if legacy.exists():
+        return legacy.resolve()
     example = cwd / EXAMPLE_CONFIG_FILE
     if example.exists():
         return example.resolve()

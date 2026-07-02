@@ -9,6 +9,7 @@ dist/
 build/
 *.egg-info/
 authnode.local.json
+.authnode/
 logs/
 run/
 data/

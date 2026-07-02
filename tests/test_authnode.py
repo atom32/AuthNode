@@ -19,7 +19,7 @@ from jwt.algorithms import RSAAlgorithm
 
 from authnode.catalog import AuthCatalog, SESSION_COOKIE_NAME
 from authnode.cli import main as cli_main
-from authnode.config import AuthNodeConfig, load_config
+from authnode.config import AuthNodeConfig, load_config, resolve_config_path
 from authnode.contract import check_contract
 from authnode.identity import issue_identity_token, trusted_headers_for_user
 from authnode.jwt import decode_hs256
@@ -45,7 +45,7 @@ CONFIG_DATA = {
         }
     ],
     "targets": {
-        "fastreact": {"base_url": "http://127.0.0.1:8000", "mode": "jwt"},
+        "fastreact": {"base_url": "http://127.0.0.1:18741", "mode": "jwt"},
         "pska": {"base_url": "http://127.0.0.1:8765", "mode": "jwt"},
     },
 }
@@ -54,6 +54,27 @@ CONFIG_DATA = {
 class AuthNodeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = AuthNodeConfig.from_dict(CONFIG_DATA)
+
+    def test_resolve_config_path_prefers_hidden_project_config(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hidden = root / ".authnode" / "config.json"
+            hidden.parent.mkdir()
+            hidden.write_text(json.dumps({"issuer": "hidden"}), encoding="utf-8")
+            legacy = root / "authnode.local.json"
+            legacy.write_text(json.dumps({"issuer": "legacy"}), encoding="utf-8")
+
+            with patch("authnode.config.Path.cwd", return_value=root):
+                self.assertEqual(resolve_config_path(), hidden.resolve())
+
+    def test_resolve_config_path_falls_back_to_legacy_local_config(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            legacy = root / "authnode.local.json"
+            legacy.write_text(json.dumps({"issuer": "legacy"}), encoding="utf-8")
+
+            with patch("authnode.config.Path.cwd", return_value=root):
+                self.assertEqual(resolve_config_path(), legacy.resolve())
 
     def test_token_claims_match_fastreact_and_pska_contract(self) -> None:
         token, claims = issue_identity_token(self.config, "pska:alice", audience=["fastreact", "pska"])

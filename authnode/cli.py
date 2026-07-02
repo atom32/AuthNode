@@ -20,7 +20,7 @@ from authnode.server import serve
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="authnode")
-    parser.add_argument("--config", help="Path to authnode.local.json")
+    parser.add_argument("--config", help="Path to AuthNode JSON config")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = subparsers.add_parser("serve", help="Run the local auth broker")
