@@ -679,6 +679,37 @@ class AuthNodeTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
+    def test_local_iam_login_form_uses_catalog_tenant_select(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config = local_iam_config(tmpdir)
+            catalog = AuthCatalog(config)
+            catalog.seed_from_config()
+            catalog.create_tenant("tenant_b", tenant_key="tenant-beta", name="Tenant B")
+
+            server = AuthNodeHTTPServer(("127.0.0.1", 0), AuthNodeHandler, config)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                with urlopen(f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback", timeout=5) as response:
+                    page = response.read().decode("utf-8")
+
+                self.assertIn('<select name="tenant_id"', page)
+                self.assertNotIn('list="tenant-options"', page)
+                self.assertIn('<option value="tenant_a" selected>tenant_a</option>', page)
+                self.assertIn('<option value="tenant_b">Tenant B (tenant_b / tenant-beta)</option>', page)
+
+                with urlopen(
+                    f"{base_url}/login?target=pska&return_to=http%3A%2F%2Fpska.local%2Fauth%2Fcallback&tenant_key=tenant-beta",
+                    timeout=5,
+                ) as response:
+                    selected_page = response.read().decode("utf-8")
+                self.assertIn('<option value="tenant_b" selected>Tenant B (tenant_b / tenant-beta)</option>', selected_page)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_local_iam_provider_account_can_bind_external_identity_to_membership(self) -> None:
         with TemporaryDirectory() as tmpdir:
             config = local_iam_config(tmpdir)

@@ -422,10 +422,12 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
             username = (requested_user or "").removeprefix("pska:")
             tenants = self.server.catalog.list_tenants()
             tenant_value = requested_tenant or (tenants[0]["tenant_id"] if tenants else "")
-            tenant_options = "\n".join(
-                f'<option value="{html.escape(str(tenant["tenant_id"]), quote=True)}">{html.escape(str(tenant.get("name") or tenant["tenant_id"]))}</option>'
-                for tenant in tenants
-            )
+            tenant_options = "\n".join(_tenant_select_option(tenant, selected_tenant=tenant_value) for tenant in tenants)
+            if not tenant_options:
+                tenant_options = '<option value="" disabled selected>No active tenants</option>'
+            tenant_control = f"""<select name="tenant_id" autocomplete="organization" required>
+          {tenant_options}
+        </select>"""
         else:
             default_user = self.server.config.user_for(requested_user, tenant_id_or_key=requested_tenant)
             username = requested_user or default_user.user_id
@@ -436,6 +438,10 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
                 f'<option value="{html.escape(tenant.tenant_key or tenant.tenant_id, quote=True)}">{html.escape(tenant.name or tenant.tenant_key or tenant.tenant_id)}</option>'
                 for tenant in self.server.config.tenants
             )
+            tenant_control = f"""<input name="tenant_id" list="tenant-options" value="{html.escape(tenant_value, quote=True)}" autocomplete="organization" required>
+        <datalist id="tenant-options">
+          {tenant_options}
+        </datalist>"""
         body = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -444,12 +450,14 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
   <title>AuthNode Login</title>
   <style>
     :root {{ color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    *, *::before, *::after {{ box-sizing: border-box; }}
     body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f7f7f4; color: #171717; }}
     main {{ width: min(430px, calc(100vw - 32px)); border: 1px solid #d7d7cf; border-radius: 8px; background: #fff; padding: 28px; box-shadow: 0 18px 50px rgba(28, 31, 35, 0.10); }}
     h1 {{ margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }}
     p {{ margin: 0 0 20px; color: #666; line-height: 1.5; }}
-    label {{ display: grid; gap: 8px; margin: 16px 0; font-size: 13px; color: #555; }}
-    select, input {{ min-height: 42px; border: 1px solid #cbc7ba; border-radius: 7px; padding: 0 12px; font: inherit; background: #fff; }}
+    label {{ display: grid; gap: 8px; min-width: 0; margin: 16px 0; font-size: 13px; color: #555; }}
+    select, input {{ width: 100%; max-width: 100%; min-width: 0; min-height: 42px; border: 1px solid #cbc7ba; border-radius: 7px; padding: 0 12px; font: inherit; background: #fff; }}
+    select {{ overflow: hidden; text-overflow: ellipsis; }}
     small {{ color: #777; line-height: 1.4; }}
     button {{ width: 100%; height: 42px; margin-top: 8px; border: 0; border-radius: 7px; background: #245b52; color: white; font-weight: 700; cursor: pointer; }}
   </style>
@@ -464,10 +472,7 @@ class AuthNodeHandler(BaseHTTPRequestHandler):
       <input type="hidden" name="next" value="{html.escape(next_path, quote=True)}">
       <input type="hidden" name="state" value="{html.escape(_first(params.get("state")) or "", quote=True)}">
       <label>Tenant
-        <input name="tenant_id" list="tenant-options" value="{html.escape(tenant_value, quote=True)}" autocomplete="organization" required>
-        <datalist id="tenant-options">
-          {tenant_options}
-        </datalist>
+        {tenant_control}
       </label>
       <label>Username
         <input name="username" value="{html.escape(username, quote=True)}" autocomplete="username" required>
@@ -1545,6 +1550,26 @@ def _user_option(user: Mapping[str, Any], *, selected_user: str | None, selected
     value = html.escape(f"{user_key}|{tenant_id}", quote=True)
     label = html.escape(" / ".join(part for part in label_parts if part), quote=True)
     return f'<option value="{value}"{selected}>{label}</option>'
+
+
+def _tenant_select_option(tenant: Mapping[str, Any], *, selected_tenant: str | None) -> str:
+    tenant_id = str(tenant.get("tenant_id") or tenant.get("tenant_key") or "")
+    tenant_key = str(tenant.get("tenant_key") or tenant_id)
+    name = str(tenant.get("name") or "")
+    selected = " selected" if selected_tenant in {tenant_id, tenant_key} else ""
+    value = html.escape(tenant_id, quote=True)
+    label = html.escape(_tenant_option_label(tenant_id=tenant_id, tenant_key=tenant_key, name=name))
+    return f'<option value="{value}"{selected}>{label}</option>'
+
+
+def _tenant_option_label(*, tenant_id: str, tenant_key: str, name: str) -> str:
+    if name and name not in {tenant_id, tenant_key}:
+        if tenant_key and tenant_key != tenant_id:
+            return f"{name} ({tenant_id} / {tenant_key})"
+        return f"{name} ({tenant_id})"
+    if tenant_key and tenant_key != tenant_id:
+        return f"{tenant_id} ({tenant_key})"
+    return tenant_id
 
 
 def _bearer_token(value: str | None) -> str | None:
